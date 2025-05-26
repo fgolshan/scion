@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 
 	"github.com/gopacket/gopacket"
+	"github.com/x448/float16"
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/private/serrors"
@@ -505,6 +506,206 @@ func (i *SCMPPacketTooBig) SerializeTo(b gopacket.SerializeBuffer,
 
 func decodeSCMPPacketTooBig(data []byte, pb gopacket.PacketBuilder) error {
 	s := &SCMPPacketTooBig{}
+	if err := s.DecodeFromBytes(data, pb); err != nil {
+		return err
+	}
+	pb.AddLayer(s)
+	return pb.NextDecoder(s.NextLayerType())
+}
+
+// SCMPPacketPProbe represents the structure of a P-Probe from Polaris.
+// Baselayer = Type | Code | Checksum
+// type SCMPPacketPProbe struct {
+// 	NextHeader uint8
+// 	ExtLen     uint8
+// 	BaseLayer
+// 	RequestIdentifier uint16
+// 	SequenceNumber    uint16
+// 	CumQueuingDelay   uint16
+// 	ASIdentifier      addr.IA
+// 	InterfaceID       uint64
+// 	BottleneckShare   uint16
+// }
+//	 0                   1                   2                   3
+//	 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|   NextHeader  |    ExtLen     |   Type        |     Code 	    |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|           Checksum            |          Request Identifier   |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|           Sequence Number     |    Cumulative Queuing Delay   |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|              ISD              |                               |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+         AS                    +  AS Identifier
+//	|                                                               |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|       InterfaceID             |       BottleneckShare         |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+type SCMPPProbeRequest struct {
+	BaseLayer
+	NextHeader        uint8 //L4ProtocolType
+	ExtLen            uint8
+	RequestIdentifier uint16
+	SequenceNumber    uint16
+	CumQueuingDelay   float16.Float16 //float16.Float16 store in uint format and then convert while retrieving
+	ASIdentifier      addr.IA
+	InterfaceID       uint16
+	BottleneckShare   float16.Float16 //float16.Float16 store in uint format and then convert while retrieving
+	// nedded to change the serialize and decode functions
+}
+
+func (*SCMPPProbeRequest) LayerType() gopacket.LayerType {
+	return LayerTypeSCMPPProbeRequest
+}
+
+func (*SCMPPProbeRequest) NextLayerType() gopacket.LayerType {
+	return gopacket.LayerTypePayload
+}
+
+func (i *SCMPPProbeRequest) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
+	//ignore baselayer size, 1 NextHeader, 1 ExtLen, 2 reqId, 2 seqNum, 2 CumQueuingDelay, 8 ASIdentifier, 2 InterfaceID, 2 BottleneckShare
+	minLength := 1 + 1 + 2 + 2 + 2 + addr.IABytes + 2 + 2
+	if size := len(data); size < minLength {
+		df.SetTruncated()
+		return serrors.New("buffer too short", "min", minLength, "actual", size)
+	}
+	offset := 0
+	i.NextHeader = data[offset]
+	offset += 1
+	i.ExtLen = data[offset]
+	offset += 1
+	i.RequestIdentifier = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+	i.SequenceNumber = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+	i.CumQueuingDelay = float16.Frombits(binary.BigEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	i.ASIdentifier = addr.IA(binary.BigEndian.Uint64(data[offset : offset+addr.IABytes]))
+	offset += addr.IABytes
+	i.InterfaceID = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+	i.BottleneckShare = float16.Frombits(binary.BigEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	i.BaseLayer = BaseLayer{
+		Contents: data[:offset],
+		Payload:  data[offset:],
+	}
+	return nil
+}
+
+func (i *SCMPPProbeRequest) SerializeTo(b gopacket.SerializeBuffer, opts gopacket.SerializeOptions) error {
+	buf, err := b.PrependBytes(1 + 1 + 2 + 2 + 2 + addr.IABytes + 2 + 2)
+	if err != nil {
+		return err
+	}
+	offset := 0
+	buf[offset] = uint8(i.NextHeader)
+	offset += 1
+	buf[offset] = i.ExtLen
+	offset += 1
+	binary.BigEndian.PutUint16(buf[offset:offset+2], i.RequestIdentifier)
+	offset += 2
+	binary.BigEndian.PutUint16(buf[offset:offset+2], i.SequenceNumber)
+	offset += 2
+	binary.BigEndian.PutUint16(buf[offset:offset+2], i.CumQueuingDelay.Bits())
+	offset += 2
+	binary.BigEndian.PutUint64(buf[offset:offset+addr.IABytes], uint64(i.ASIdentifier))
+	offset += addr.IABytes
+	binary.BigEndian.PutUint16(buf[offset:offset+2], i.InterfaceID)
+	offset += 2
+	binary.BigEndian.PutUint16(buf[offset:offset+2], i.BottleneckShare.Bits())
+	return nil
+}
+
+func decodeSCMPPProbeRequest(data []byte, pb gopacket.PacketBuilder) error {
+	s := &SCMPPProbeRequest{}
+	if err := s.DecodeFromBytes(data, pb); err != nil {
+		return err
+	}
+	pb.AddLayer(s)
+	return pb.NextDecoder(s.NextLayerType())
+}
+
+// // P-CA Congestion Alert message
+// type SCMPPacketPCA struct {
+// 	BaseLayer
+// 	RequestIdentifier uint16
+// 	SequenceNumber    uint16
+// 	ASIdentifier      addr.IA
+// 	InterfaceID       uint64
+// }
+//	 0                   1                   2                   3
+//	 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|   Type		|     Code 	    |           Checksum            |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|          Request Identifier   |       Sequence Number         |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|              ISD              |                               |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+         AS                    +  AS Identifier
+//	|                                                               |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|      InterfaceID              |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+type SCMPPCongestionAlert struct {
+	BaseLayer
+	RequestIdentifier uint16
+	SequenceNumber    uint16
+	ASIdentifier      addr.IA
+	InterfaceID       uint16
+}
+
+func (*SCMPPCongestionAlert) LayerType() gopacket.LayerType {
+	return LayerTypeSCMPPCongestionAlert
+}
+
+func (*SCMPPCongestionAlert) NextLayerType() gopacket.LayerType {
+	return gopacket.LayerTypePayload
+}
+
+func (i *SCMPPCongestionAlert) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
+	//ignore baselayer size, 2 reqId, 2 seqNum, 8 ASIdentifier, 2 InterfaceID
+	minLength := 2 + 2 + addr.IABytes + 2
+	if size := len(data); size < minLength {
+		df.SetTruncated()
+		return serrors.New("buffer too short", "min", minLength, "actual", size)
+	}
+	offset := 0
+	i.RequestIdentifier = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+	i.SequenceNumber = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+	i.ASIdentifier = addr.IA(binary.BigEndian.Uint64(data[offset : offset+addr.IABytes]))
+	offset += addr.IABytes
+	i.InterfaceID = binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+	i.BaseLayer = BaseLayer{
+		Contents: data[:offset],
+		Payload:  data[offset:],
+	}
+	return nil
+}
+
+func (i *SCMPPCongestionAlert) SerializeTo(b gopacket.SerializeBuffer, opts gopacket.SerializeOptions) error {
+	buf, err := b.PrependBytes(2 + 2 + addr.IABytes + 2)
+	if err != nil {
+		return err
+	}
+	offset := 0
+	binary.BigEndian.PutUint16(buf[offset:offset+2], i.RequestIdentifier)
+	offset += 2
+	binary.BigEndian.PutUint16(buf[offset:offset+2], i.SequenceNumber)
+	offset += 2
+	binary.BigEndian.PutUint64(buf[offset:offset+addr.IABytes], uint64(i.ASIdentifier))
+	offset += addr.IABytes
+	binary.BigEndian.PutUint16(buf[offset:offset+2], i.InterfaceID)
+	return nil
+}
+
+func decodeSCMPPCongestionAlert(data []byte, pb gopacket.PacketBuilder) error {
+	s := &SCMPPCongestionAlert{}
 	if err := s.DecodeFromBytes(data, pb); err != nil {
 		return err
 	}

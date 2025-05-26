@@ -1,0 +1,2787 @@
+diff --git a/WORKSPACE b/WORKSPACE
+index e5166dd79..071d35f86 100644
+--- a/WORKSPACE
++++ b/WORKSPACE
+@@ -306,3 +306,12 @@ http_archive(
+ register_toolchains(
+     "//dist/openwrt:x86_64_openwrt_toolchain",
+ )
++
++load("@bazel_gazelle//:deps.bzl", "go_repository")
++
++go_repository(
++    name = "com_github_x448_float16",
++    importpath = "github.com/x448/float16",
++    sum = "h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=",
++    version = "v0.8.4",
++)
+\ No newline at end of file
+diff --git a/bazel-remote.yml b/bazel-remote.yml
+index b98b18c7b..ba155b199 100644
+--- a/bazel-remote.yml
++++ b/bazel-remote.yml
+@@ -1,5 +1,4 @@
+ version: "2.4"
+-name: bazel_remote
+ services:
+   bazel-remote:
+     container_name: bazel-remote-cache
+diff --git a/control/tasks.go b/control/tasks.go
+index 4de2588cc..ea595a511 100644
+--- a/control/tasks.go
++++ b/control/tasks.go
+@@ -26,6 +26,7 @@ import (
+ 	"github.com/scionproto/scion/control/ifstate"
+ 	"github.com/scionproto/scion/pkg/addr"
+ 	"github.com/scionproto/scion/pkg/experimental/hiddenpath"
++	"github.com/scionproto/scion/pkg/log"
+ 	"github.com/scionproto/scion/pkg/metrics"
+ 	seg "github.com/scionproto/scion/pkg/segment"
+ 	"github.com/scionproto/scion/pkg/snet"
+@@ -84,6 +85,7 @@ func (t *TasksConfig) Originator() *periodic.Runner {
+ 	if !t.Core {
+ 		return nil
+ 	}
++	log.Debug("Starting beacon originator")
+ 	s := &beaconing.Originator{
+ 		Extender: t.extender("originator", t.IA, t.MTU, func() uint8 {
+ 			return t.BeaconStore.MaxExpTime(beacon.PropPolicy)
+@@ -272,6 +274,7 @@ func StartTasks(cfg TasksConfig) (*Tasks, error) {
+ 
+ 	segCleaner := pathdb.NewCleaner(cfg.PathDB, "control_pathstorage_segments")
+ 	segRevCleaner := revcache.NewCleaner(cfg.RevCache, "control_pathstorage_revocation")
++	log.Debug("Starting periodic tasks")
+ 	return &Tasks{
+ 		Originator: cfg.Originator(),
+ 		Propagator: cfg.Propagator(),
+diff --git a/control/trust.go b/control/trust.go
+index cff947de3..f2bdd2891 100644
+--- a/control/trust.go
++++ b/control/trust.go
+@@ -37,6 +37,7 @@ func LoadTrustMaterial(ctx context.Context, configDir string, db trust.DB) error
+ 	if err != nil {
+ 		return serrors.Wrap("loading TRCs from disk", err)
+ 	}
++	logger.Debug("Message to confirm that it works.")
+ 	logger.Info("TRCs loaded", "files", loaded.Loaded)
+ 	for f, r := range loaded.Ignored {
+ 		if errors.Is(r, trust.ErrAlreadyExists) {
+diff --git a/dispatcher/dispatcher.go b/dispatcher/dispatcher.go
+index 02e442d68..2c4e1617f 100644
+--- a/dispatcher/dispatcher.go
++++ b/dispatcher/dispatcher.go
+@@ -161,6 +161,7 @@ func (s *Server) processMsgNextHop(
+ 	underlay netip.Addr,
+ 	prevHop netip.AddrPort,
+ ) ([]byte, netip.AddrPort, error) {
++	log.Debug("Processing message", "buf", buf)
+ 
+ 	err := s.parser.DecodeLayers(buf, &s.decoded)
+ 	if err != nil {
+@@ -198,10 +199,13 @@ func (s *Server) processMsgNextHop(
+ 	switch s.decoded[len(s.decoded)-1] {
+ 	case slayers.LayerTypeSCMP:
+ 		// send response to BR
++		log.Debug("Layertype SCMP, sending to BR")
+ 		if s.scmpLayer.TypeCode.Type() == slayers.SCMPTypeTracerouteRequest ||
+ 			s.scmpLayer.TypeCode.Type() == slayers.SCMPTypeEchoRequest {
+ 			dstAddrPort = prevHop
++			log.Debug("SCMPInfo packet, sending to previous hop", "prevHop", prevHop, "type", slayers.SCMPTypeEchoRequest)
+ 		} else { // relay to end application
++			log.Debug("SCMPInfo packet, sending to end application, no scmp echo")
+ 			dstAddrPort, err = s.getDstSCMP()
+ 			if err != nil {
+ 				log.Error("Getting destination for SCMP message", "err", err)
+@@ -215,6 +219,7 @@ func (s *Server) processMsgNextHop(
+ 			}
+ 		}
+ 	case slayers.LayerTypeSCIONUDP:
++		log.Debug("Layertype SCIONUDP, sending to end application")
+ 		dstAddrPort, err = s.getDstSCIONUDP()
+ 		if err != nil {
+ 			log.Error("Getting destination for SCION/UDP message", "err", err)
+@@ -234,6 +239,7 @@ func (s *Server) processMsgNextHop(
+ 		(s.scmpLayer.TypeCode.Type() == slayers.SCMPTypeTracerouteRequest ||
+ 			s.scmpLayer.TypeCode.Type() == slayers.SCMPTypeEchoRequest) {
+ 		err = s.replyToSCMPInfoRequest()
++		log.Debug("Replying to SCMPInfo request", "type", s.scmpLayer.TypeCode.Type())
+ 		if err != nil {
+ 			log.Error("Reversing SCMP information", "err", err)
+ 			return nil, netip.AddrPort{}, nil
+diff --git a/gateway/routing/testdata/extensive.policy b/gateway/routing/testdata/extensive.policy
+index 9d1213a8d..f384c6a77 100644
+--- a/gateway/routing/testdata/extensive.policy
++++ b/gateway/routing/testdata/extensive.policy
+@@ -1,4 +1,4 @@
+-accept              1-ff00:0:110     1-ff00:0:112    127.0.0.0/24,127.0.1.0/24                   # Rule one
++accept              0-150     1-ff00:0:112    127.0.0.0/24,127.0.1.0/24                   # Rule one
+ reject              1-ff00:0:110     1-ff00:0:112    !127.0.0.0/24                               # Rule two
+ reject              1-0              1-ff00:0:112    127.0.0.0/24
+ accept              1-ff00:0:111     0-0             127.0.1.0/24                                # Rule four
+diff --git a/go.mod b/go.mod
+index 8cd40e627..4a14f180a 100644
+--- a/go.mod
++++ b/go.mod
+@@ -75,6 +75,7 @@ require (
+ 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
+ 	github.com/goccy/go-json v0.10.2 // indirect
+ 	github.com/google/go-querystring v1.1.0 // indirect
++	github.com/google/gopacket v1.1.19 // indirect
+ 	github.com/google/pprof v0.0.0-20250128161936-077ca0a936bf // indirect
+ 	github.com/google/uuid v1.6.0 // indirect
+ 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
+@@ -113,6 +114,7 @@ require (
+ 	github.com/subosito/gotenv v1.6.0 // indirect
+ 	github.com/uber/jaeger-lib v2.4.1+incompatible // indirect
+ 	github.com/vishvananda/netns v0.0.4 // indirect
++	github.com/x448/float16 v0.8.4 // indirect
+ 	go.uber.org/atomic v1.11.0 // indirect
+ 	go.uber.org/mock v0.5.0 // indirect
+ 	go.uber.org/multierr v1.11.0 // indirect
+diff --git a/go.sum b/go.sum
+index 43cab13a3..3a95b1d5b 100644
+--- a/go.sum
++++ b/go.sum
+@@ -102,6 +102,8 @@ github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeN
+ github.com/google/go-querystring v1.0.0/go.mod h1:odCYkC5MyYFN7vkCjXpyrEuKhc/BUO6wN/zVPAxq5ck=
+ github.com/google/go-querystring v1.1.0 h1:AnCroh3fv4ZBgVIf1Iwtovgjaw/GiKJo8M8yD/fhyJ8=
+ github.com/google/go-querystring v1.1.0/go.mod h1:Kcdr2DB4koayq7X8pmAG4sNG59So17icRSOU623lUBU=
++github.com/google/gopacket v1.1.19 h1:ves8RnFZPGiFnTS0uPQStjwru6uO6h+nlr9j6fL7kF8=
++github.com/google/gopacket v1.1.19/go.mod h1:iJ8V8n6KS+z2U1A8pUwu8bW5SyEMkXJB8Yo/Vo+TKTo=
+ github.com/google/pprof v0.0.0-20250128161936-077ca0a936bf h1:BvBLUD2hkvLI3dJTJMiopAq8/wp43AAZKTP7qdpptbU=
+ github.com/google/pprof v0.0.0-20250128161936-077ca0a936bf/go.mod h1:vavhavw2zAxS5dIdcRluK6cSGGPlZynqzFM8NdvU144=
+ github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+@@ -281,6 +283,8 @@ github.com/vishvananda/netlink v1.2.1-beta.2/go.mod h1:twkDnbuQxJYemMlGd4JFIcuhg
+ github.com/vishvananda/netns v0.0.0-20200728191858-db3c7e526aae/go.mod h1:DD4vA1DwXk04H54A1oHXtwZmA0grkVMdPxx/VGLCah0=
+ github.com/vishvananda/netns v0.0.4 h1:Oeaw1EM2JMxD51g9uhtC0D7erkIjgmj8+JZc26m1YX8=
+ github.com/vishvananda/netns v0.0.4/go.mod h1:SpkAiCQRtJ6TvvxPnOSyH3BMl6unz3xZlaprSwhNNJM=
++github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
++github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
+ github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
+ github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
+ github.com/yuin/goldmark v1.4.1/go.mod h1:mwnBkeHKe2W/ZEtQ+71ViKU8L12m81fl3OWwC1Zlc8k=
+@@ -325,10 +329,12 @@ golang.org/x/lint v0.0.0-20181026193005-c67002cb31c3/go.mod h1:UVdnD1Gm6xHRNCYTk
+ golang.org/x/lint v0.0.0-20190227174305-5b3e6a55c961/go.mod h1:wehouNa3lNwaWXcvxsM5YxQ5yQlVC4a0KAMCusXpPoU=
+ golang.org/x/lint v0.0.0-20190313153728-d0100b6bd8b3/go.mod h1:6SW0HCj/g11FgYtHlgUYUwCkIfeOF89ocIRzGO/8vkc=
+ golang.org/x/lint v0.0.0-20190930215403-16217165b5de/go.mod h1:6SW0HCj/g11FgYtHlgUYUwCkIfeOF89ocIRzGO/8vkc=
++golang.org/x/lint v0.0.0-20200302205851-738671d3881b/go.mod h1:3xt1FjdF8hUf6vQPIChWIBhFzV8gjjsPE/fR3IyQdNY=
+ golang.org/x/lint v0.0.0-20210508222113-6edffad5e616 h1:VLliZ0d+/avPrXXH+OakdXhpJuEoBZuwh1m2j7U6Iug=
+ golang.org/x/lint v0.0.0-20210508222113-6edffad5e616/go.mod h1:3xt1FjdF8hUf6vQPIChWIBhFzV8gjjsPE/fR3IyQdNY=
+ golang.org/x/mobile v0.0.0-20190719004257-d2bd2a29d028/go.mod h1:E/iHnbuqvinMTCcRqshq8CkpyQDoeVncDDYHnLhea+o=
+ golang.org/x/mod v0.1.0/go.mod h1:0QHyrYULN0/3qlju5TqG8bIK38QM8yzMo5ekMj3DlcY=
++golang.org/x/mod v0.1.1-0.20191105210325-c90efee705ee/go.mod h1:QqPTAvyqsEbceGzBzNggFXnrqF1CaUcvgkdR5Ot7KZg=
+ golang.org/x/mod v0.2.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+ golang.org/x/mod v0.3.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+ golang.org/x/mod v0.5.1/go.mod h1:5OXOZSfqPIIbmVBIIKWRFfZjPR0E5r58TLhUjH0a2Ro=
+@@ -417,6 +423,7 @@ golang.org/x/tools v0.0.0-20190524140312-2c0ae7006135/go.mod h1:RgjU9mgBXZiqYHBn
+ golang.org/x/tools v0.0.0-20191012152004-8de300cfc20a/go.mod h1:b+2E5dAYhXwXZwtnZ6UAqBI28+e2cm9otk0dWdXHAEo=
+ golang.org/x/tools v0.0.0-20191108193012-7d206e10da11/go.mod h1:b+2E5dAYhXwXZwtnZ6UAqBI28+e2cm9otk0dWdXHAEo=
+ golang.org/x/tools v0.0.0-20191119224855-298f0cb1881e/go.mod h1:b+2E5dAYhXwXZwtnZ6UAqBI28+e2cm9otk0dWdXHAEo=
++golang.org/x/tools v0.0.0-20200130002326-2f3ba24bd6e7/go.mod h1:TB2adYChydJhpapKDTa4BR/hXlZSLoq2Wpct/0txZ28=
+ golang.org/x/tools v0.0.0-20200619180055-7c47624df98f/go.mod h1:EkVYQZoAsY45+roYkvgYkIh4xh/qjgUK9TdY2XT94GE=
+ golang.org/x/tools v0.0.0-20210106214847-113979e3529a/go.mod h1:emZCQorbCU4vsT4fOWvOPXz4eW1wZW4PmDk9uLelYpA=
+ golang.org/x/tools v0.1.8/go.mod h1:nABZi5QlRsZVlzPpHl034qft6wpY4eDcsTt5AaioBiU=
+diff --git a/pkg/daemon/topology.go b/pkg/daemon/topology.go
+index b1a76b6e9..fa6c3d90a 100644
+--- a/pkg/daemon/topology.go
++++ b/pkg/daemon/topology.go
+@@ -37,10 +37,16 @@ func LoadTopology(ctx context.Context, conn Connector) (snet.Topology, error) {
+ 		return snet.Topology{}, serrors.Wrap("loading port range", err)
+ 	}
+ 	interfaces, err := conn.Interfaces(ctx)
++	// log.Debug("interfaces", "interfaces", interfaces)
++	log.Debug("ctx", "ctx", ctx)
++	// log.Debug("error", "error", err)
+ 	if err != nil {
+ 		return snet.Topology{}, serrors.Wrap("loading interfaces", err)
+ 	}
+ 
++	// log.Debug("Loaded topology", "local_ia", ia, "port_range", start, end,
++	// 	"interfaces", interfaces)
++
+ 	return snet.Topology{
+ 		LocalIA: ia,
+ 		PortRange: snet.TopologyPortRange{
+diff --git a/pkg/slayers/BUILD.bazel b/pkg/slayers/BUILD.bazel
+index cbf56b146..b5423aeaf 100644
+--- a/pkg/slayers/BUILD.bazel
++++ b/pkg/slayers/BUILD.bazel
+@@ -25,6 +25,7 @@ go_library(
+         "//pkg/slayers/path/onehop:go_default_library",
+         "//pkg/slayers/path/scion:go_default_library",
+         "@com_github_gopacket_gopacket//:go_default_library",
++        "@com_github_x448_float16//:go_default_library",
+     ],
+ )
+ 
+@@ -51,6 +52,7 @@ go_test(
+         "//pkg/slayers/path/onehop:go_default_library",
+         "//pkg/slayers/path/scion:go_default_library",
+         "@com_github_gopacket_gopacket//:go_default_library",
++        "@com_github_x448_float16//:go_default_library",
+         "@com_github_stretchr_testify//assert:go_default_library",
+         "@com_github_stretchr_testify//require:go_default_library",
+     ],
+diff --git a/pkg/slayers/layertypes.go b/pkg/slayers/layertypes.go
+index ac12583c8..025f52bcb 100644
+--- a/pkg/slayers/layertypes.go
++++ b/pkg/slayers/layertypes.go
+@@ -116,7 +116,6 @@ var (
+ 			Decoder: gopacket.DecodeFunc(decodeSCMPTraceroute),
+ 		},
+ 	)
+-
+ 	EndpointUDPPort = gopacket.RegisterEndpointType(
+ 		1005,
+ 		gopacket.EndpointTypeMetadata{
+@@ -126,6 +125,22 @@ var (
+ 			},
+ 		},
+ 	)
++	// Polaris specific layer types ------------------------------------------------------
++	LayerTypeSCMPPProbeRequest = gopacket.RegisterLayerType(
++		1132,
++		gopacket.LayerTypeMetadata{
++			Name:    "SCMPPProbeRequest",
++			Decoder: gopacket.DecodeFunc(decodeSCMPPProbeRequest),
++		},
++	)
++	LayerTypeSCMPPCongestionAlert = gopacket.RegisterLayerType(
++		1133,
++		gopacket.LayerTypeMetadata{
++			Name:    "SCMPPCongestionAlert",
++			Decoder: gopacket.DecodeFunc(decodeSCMPPCongestionAlert),
++		},
++	)
++	// ----------------------------------------------------------------------------
+ 
+ 	// layerTypeBFD is the identifier for gopacket/layers.LayerTypeBFD.
+ 	// Defining this with a constant here allows to build slayers without linking
+diff --git a/pkg/slayers/scmp.go b/pkg/slayers/scmp.go
+index 9e1d071cd..06c2160f6 100644
+--- a/pkg/slayers/scmp.go
++++ b/pkg/slayers/scmp.go
+@@ -89,6 +89,10 @@ func (s *SCMP) NextLayerType() gopacket.LayerType {
+ 		return LayerTypeSCMPEcho
+ 	case SCMPTypeTracerouteRequest, SCMPTypeTracerouteReply:
+ 		return LayerTypeSCMPTraceroute
++	case SCMPTypePolarisProbeRequest:
++		return LayerTypeSCMPPProbeRequest
++	case SCMPTypePolarisCongestionAlert:
++		return LayerTypeSCMPPCongestionAlert
+ 	}
+ 	return gopacket.LayerTypePayload
+ }
+diff --git a/pkg/slayers/scmp_msg.go b/pkg/slayers/scmp_msg.go
+index 794231296..7b309e92d 100644
+--- a/pkg/slayers/scmp_msg.go
++++ b/pkg/slayers/scmp_msg.go
+@@ -18,6 +18,7 @@ import (
+ 	"encoding/binary"
+ 
+ 	"github.com/gopacket/gopacket"
++	"github.com/x448/float16"
+ 
+ 	"github.com/scionproto/scion/pkg/addr"
+ 	"github.com/scionproto/scion/pkg/private/serrors"
+@@ -511,3 +512,203 @@ func decodeSCMPPacketTooBig(data []byte, pb gopacket.PacketBuilder) error {
+ 	pb.AddLayer(s)
+ 	return pb.NextDecoder(s.NextLayerType())
+ }
++
++// SCMPPacketPProbe represents the structure of a P-Probe from Polaris.
++// Baselayer = Type | Code | Checksum
++// type SCMPPacketPProbe struct {
++// 	NextHeader uint8
++// 	ExtLen     uint8
++// 	BaseLayer
++// 	RequestIdentifier uint16
++// 	SequenceNumber    uint16
++// 	CumQueuingDelay   uint16
++// 	ASIdentifier      addr.IA
++// 	InterfaceID       uint64
++// 	BottleneckShare   uint16
++// }
++//	 0                   1                   2                   3
++//	 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//	|   NextHeader  |    ExtLen     |   Type        |     Code 	    |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//	|           Checksum            |          Request Identifier   |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//	|           Sequence Number     |    Cumulative Queuing Delay   |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//	|              ISD              |                               |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+         AS                    +  AS Identifier
++//	|                                                               |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//	|       InterfaceID             |       BottleneckShare         |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++
++type SCMPPProbeRequest struct {
++	BaseLayer
++	NextHeader        uint8 //L4ProtocolType
++	ExtLen            uint8
++	RequestIdentifier uint16
++	SequenceNumber    uint16
++	CumQueuingDelay   float16.Float16 //float16.Float16 store in uint format and then convert while retrieving
++	ASIdentifier      addr.IA
++	InterfaceID       uint16
++	BottleneckShare   float16.Float16 //float16.Float16 store in uint format and then convert while retrieving
++	// nedded to change the serialize and decode functions
++}
++
++func (*SCMPPProbeRequest) LayerType() gopacket.LayerType {
++	return LayerTypeSCMPPProbeRequest
++}
++
++func (*SCMPPProbeRequest) NextLayerType() gopacket.LayerType {
++	return gopacket.LayerTypePayload
++}
++
++func (i *SCMPPProbeRequest) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
++	//ignore baselayer size, 1 NextHeader, 1 ExtLen, 2 reqId, 2 seqNum, 2 CumQueuingDelay, 8 ASIdentifier, 2 InterfaceID, 2 BottleneckShare
++	minLength := 1 + 1 + 2 + 2 + 2 + addr.IABytes + 2 + 2
++	if size := len(data); size < minLength {
++		df.SetTruncated()
++		return serrors.New("buffer too short", "min", minLength, "actual", size)
++	}
++	offset := 0
++	i.NextHeader = data[offset]
++	offset += 1
++	i.ExtLen = data[offset]
++	offset += 1
++	i.RequestIdentifier = binary.BigEndian.Uint16(data[offset : offset+2])
++	offset += 2
++	i.SequenceNumber = binary.BigEndian.Uint16(data[offset : offset+2])
++	offset += 2
++	i.CumQueuingDelay = float16.Frombits(binary.BigEndian.Uint16(data[offset : offset+2]))
++	offset += 2
++	i.ASIdentifier = addr.IA(binary.BigEndian.Uint64(data[offset : offset+addr.IABytes]))
++	offset += addr.IABytes
++	i.InterfaceID = binary.BigEndian.Uint16(data[offset : offset+2])
++	offset += 2
++	i.BottleneckShare = float16.Frombits(binary.BigEndian.Uint16(data[offset : offset+2]))
++	offset += 2
++	i.BaseLayer = BaseLayer{
++		Contents: data[:offset],
++		Payload:  data[offset:],
++	}
++	return nil
++}
++
++func (i *SCMPPProbeRequest) SerializeTo(b gopacket.SerializeBuffer, opts gopacket.SerializeOptions) error {
++	buf, err := b.PrependBytes(1 + 1 + 2 + 2 + 2 + addr.IABytes + 2 + 2)
++	if err != nil {
++		return err
++	}
++	offset := 0
++	buf[offset] = uint8(i.NextHeader)
++	offset += 1
++	buf[offset] = i.ExtLen
++	offset += 1
++	binary.BigEndian.PutUint16(buf[offset:offset+2], i.RequestIdentifier)
++	offset += 2
++	binary.BigEndian.PutUint16(buf[offset:offset+2], i.SequenceNumber)
++	offset += 2
++	binary.BigEndian.PutUint16(buf[offset:offset+2], i.CumQueuingDelay.Bits())
++	offset += 2
++	binary.BigEndian.PutUint64(buf[offset:offset+addr.IABytes], uint64(i.ASIdentifier))
++	offset += addr.IABytes
++	binary.BigEndian.PutUint16(buf[offset:offset+2], i.InterfaceID)
++	offset += 2
++	binary.BigEndian.PutUint16(buf[offset:offset+2], i.BottleneckShare.Bits())
++	return nil
++}
++
++func decodeSCMPPProbeRequest(data []byte, pb gopacket.PacketBuilder) error {
++	s := &SCMPPProbeRequest{}
++	if err := s.DecodeFromBytes(data, pb); err != nil {
++		return err
++	}
++	pb.AddLayer(s)
++	return pb.NextDecoder(s.NextLayerType())
++}
++
++// // P-CA Congestion Alert message
++// type SCMPPacketPCA struct {
++// 	BaseLayer
++// 	RequestIdentifier uint16
++// 	SequenceNumber    uint16
++// 	ASIdentifier      addr.IA
++// 	InterfaceID       uint64
++// }
++//	 0                   1                   2                   3
++//	 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//	|   Type		|     Code 	    |           Checksum            |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//	|          Request Identifier   |       Sequence Number         |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//	|              ISD              |                               |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+         AS                    +  AS Identifier
++//	|                                                               |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//	|      InterfaceID              |
++//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++
++type SCMPPCongestionAlert struct {
++	BaseLayer
++	RequestIdentifier uint16
++	SequenceNumber    uint16
++	ASIdentifier      addr.IA
++	InterfaceID       uint16
++}
++
++func (*SCMPPCongestionAlert) LayerType() gopacket.LayerType {
++	return LayerTypeSCMPPCongestionAlert
++}
++
++func (*SCMPPCongestionAlert) NextLayerType() gopacket.LayerType {
++	return gopacket.LayerTypePayload
++}
++
++func (i *SCMPPCongestionAlert) DecodeFromBytes(data []byte, df gopacket.DecodeFeedback) error {
++	//ignore baselayer size, 2 reqId, 2 seqNum, 8 ASIdentifier, 2 InterfaceID
++	minLength := 2 + 2 + addr.IABytes + 2
++	if size := len(data); size < minLength {
++		df.SetTruncated()
++		return serrors.New("buffer too short", "min", minLength, "actual", size)
++	}
++	offset := 0
++	i.RequestIdentifier = binary.BigEndian.Uint16(data[offset : offset+2])
++	offset += 2
++	i.SequenceNumber = binary.BigEndian.Uint16(data[offset : offset+2])
++	offset += 2
++	i.ASIdentifier = addr.IA(binary.BigEndian.Uint64(data[offset : offset+addr.IABytes]))
++	offset += addr.IABytes
++	i.InterfaceID = binary.BigEndian.Uint16(data[offset : offset+2])
++	offset += 2
++	i.BaseLayer = BaseLayer{
++		Contents: data[:offset],
++		Payload:  data[offset:],
++	}
++	return nil
++}
++
++func (i *SCMPPCongestionAlert) SerializeTo(b gopacket.SerializeBuffer, opts gopacket.SerializeOptions) error {
++	buf, err := b.PrependBytes(2 + 2 + addr.IABytes + 2)
++	if err != nil {
++		return err
++	}
++	offset := 0
++	binary.BigEndian.PutUint16(buf[offset:offset+2], i.RequestIdentifier)
++	offset += 2
++	binary.BigEndian.PutUint16(buf[offset:offset+2], i.SequenceNumber)
++	offset += 2
++	binary.BigEndian.PutUint64(buf[offset:offset+addr.IABytes], uint64(i.ASIdentifier))
++	offset += addr.IABytes
++	binary.BigEndian.PutUint16(buf[offset:offset+2], i.InterfaceID)
++	return nil
++}
++
++func decodeSCMPPCongestionAlert(data []byte, pb gopacket.PacketBuilder) error {
++	s := &SCMPPCongestionAlert{}
++	if err := s.DecodeFromBytes(data, pb); err != nil {
++		return err
++	}
++	pb.AddLayer(s)
++	return pb.NextDecoder(s.NextLayerType())
++}
+diff --git a/pkg/slayers/scmp_typecode.go b/pkg/slayers/scmp_typecode.go
+index eb61d1dcf..2a8c5b335 100644
+--- a/pkg/slayers/scmp_typecode.go
++++ b/pkg/slayers/scmp_typecode.go
+@@ -80,6 +80,9 @@ const (
+ 	SCMPTypeEchoReply         SCMPType = 129
+ 	SCMPTypeTracerouteRequest SCMPType = 130
+ 	SCMPTypeTracerouteReply   SCMPType = 131
++	// New SCMP types for Polaris
++	SCMPTypePolarisProbeRequest    SCMPType = 132
++	SCMPTypePolarisCongestionAlert SCMPType = 133
+ )
+ 
+ // SCMPTypeCode represents SCMP type/code case.
+@@ -138,6 +141,9 @@ var scmpTypeCodeInfo = map[SCMPType]struct {
+ 	SCMPTypeEchoReply:                {name: "EchoReply"},
+ 	SCMPTypeTracerouteRequest:        {name: "TracerouteRequest"},
+ 	SCMPTypeTracerouteReply:          {name: "TracerouteReply"},
++	// New SCMP types for Polaris
++	SCMPTypePolarisProbeRequest:    {name: "PolarisProbeRequest"},
++	SCMPTypePolarisCongestionAlert: {name: "PolarisCongestionAlertRequest"},
+ 	SCMPTypeParameterProblem: {
+ 		"ParameterProblem", map[SCMPCode]string{
+ 			SCMPCodeErroneousHeaderField:      "ErroneousHeaderField",
+diff --git a/pkg/snet/BUILD.bazel b/pkg/snet/BUILD.bazel
+index ec8cfe8ea..d6b4610c1 100644
+--- a/pkg/snet/BUILD.bazel
++++ b/pkg/snet/BUILD.bazel
+@@ -39,6 +39,7 @@ go_library(
+         "//private/topology:go_default_library",
+         "//private/topology/underlay:go_default_library",
+         "@com_github_gopacket_gopacket//:go_default_library",
++        "@com_github_x448_float16//:go_default_library",
+     ] + select({
+         "@io_bazel_rules_go//go/platform:windows": [
+             "@org_golang_x_sys//windows:go_default_library",
+@@ -67,5 +68,6 @@ go_test(
+         "//pkg/snet/path:go_default_library",
+         "@com_github_stretchr_testify//assert:go_default_library",
+         "@com_github_stretchr_testify//require:go_default_library",
++        "@com_github_x448_float16//:go_default_library",
+     ],
+ )
+diff --git a/pkg/snet/packet.go b/pkg/snet/packet.go
+index b95e65579..9c1ab61a5 100644
+--- a/pkg/snet/packet.go
++++ b/pkg/snet/packet.go
+@@ -18,6 +18,7 @@ import (
+ 	"math/rand/v2"
+ 
+ 	"github.com/gopacket/gopacket"
++	"github.com/x448/float16"
+ 
+ 	"github.com/scionproto/scion/pkg/addr"
+ 	"github.com/scionproto/scion/pkg/private/common"
+@@ -345,6 +346,106 @@ func toLayers(scmpPld SCMPPayload,
+ 	return l
+ }
+ 
++// Implementation of Polaris specific types --------------------------------------------
++// Pprobe:
++//
++//	Enables the endhost to receive an estimate of the bottleneck bandwith.
++//	The routers on the paths are aware of their link capacity and can keep track of the number of flows traversing it.
++//	After the Pprobe traversed the path, the destination sends back an echo reply of the Pprobe.
++//
++// Pprobe Fields:
++// NextHdr: Specifies the type of the next header
++// ExtLen: Specifies the length of the extension header
++// Type, Code and Checksum: Are taken from SCMPPayload. The type codes are defined in scmp_typecode.go
++//
++//	SCMPTypePolarisProbeRequest    SCMPType = 132
++//	SCMPTypePolarisCongestionAlert SCMPType = 133
++//
++// RequestIdentifier: A unique identifier for the request. 16 bit size
++// SequenceNumber: A unique sequence number for the request. 16 bit size
++//
++//	They help in matching the echo return message to the probe message.
++//
++// CumQueuingDelay: The cumulative queuing delay inside the queue of each border router. 16 bit size
++// ASIdentifier: The AS identifier of the AS that the probe is sent to. 64 bit size
++// InterfaceID: The interface identifier of the interface that is the bottelneck. 16 bit size
++//
++//  These two fields can be set to zero to conceal the bottleneck location.
++//
++// BottleneckShare: The bottleneck share of the link. 16 bit size in IEEE-754 half-precision floating point format.
++
++type SCMPPProbeRequest struct {
++	NextHdr           uint8 //slayers.L4ProtocolType
++	ExtLen            uint8
++	RequestIdentifier uint16
++	SequenceNumber    uint16
++	CumQueuingDelay   float16.Float16 //float16.Float16 store in uint format and then convert while retrieving
++	ASIdentifier      addr.IA
++	InterfaceID       uint16
++	BottleneckShare   float16.Float16 //float16.Float16 store in uint format and then convert while retrieving
++	//Payload           []byte
++}
++
++func (m SCMPPProbeRequest) toLayers(scn *slayers.SCION) []gopacket.SerializableLayer {
++	return toLayers(m, scn,
++		&slayers.SCMPPProbeRequest{
++			NextHeader:        m.NextHdr,
++			ExtLen:            m.ExtLen,
++			RequestIdentifier: m.RequestIdentifier,
++			SequenceNumber:    m.SequenceNumber,
++			CumQueuingDelay:   m.CumQueuingDelay,
++			ASIdentifier:      m.ASIdentifier,
++			InterfaceID:       m.InterfaceID,
++			BottleneckShare:   m.BottleneckShare,
++		},
++		nil,
++	)
++}
++
++func (SCMPPProbeRequest) Type() slayers.SCMPType { return slayers.SCMPTypePolarisProbeRequest }
++
++func (SCMPPProbeRequest) Code() slayers.SCMPCode { return 0 }
++
++func (m SCMPPProbeRequest) length() int {
++	// 3 * 64 bits
++	return 192
++}
++
++// Does not need a reply struct. This is because an echo is used to send the probe back to the source.
++
++// P - CA:
++// RequestIdentifier and SequenceNumber are set to the same values as the Pprobe.
++// ASIdentifier and InterfaceID are set to the alert originator.
++type SCMPPCongestionAlert struct {
++	RequestIdentifier uint16
++	SequenceNumber    uint16
++	ASIdentifier      addr.IA
++	InterfaceID       uint16
++}
++
++func (m SCMPPCongestionAlert) toLayers(scn *slayers.SCION) []gopacket.SerializableLayer {
++	return toLayers(m, scn,
++		&slayers.SCMPPCongestionAlert{
++			RequestIdentifier: m.RequestIdentifier,
++			SequenceNumber:    m.SequenceNumber,
++			ASIdentifier:      m.ASIdentifier,
++			InterfaceID:       m.InterfaceID,
++		},
++		nil,
++	)
++}
++
++func (SCMPPCongestionAlert) Type() slayers.SCMPType { return slayers.SCMPTypePolarisCongestionAlert }
++
++func (SCMPPCongestionAlert) Code() slayers.SCMPCode { return 0 }
++
++func (m SCMPPCongestionAlert) length() int {
++	// 2 * 64 bits + 16 bits
++	return 144
++}
++
++// --------------------------------------------------------------------------------------------
++
+ // RawPath is the unprocessed path that is read from a received SCION packet
+ //
+ // Packets that are received on the SCIONPacketConn contain a struct of this
+@@ -536,6 +637,36 @@ func (p *Packet) Decode() error {
+ 				IA:         v.IA,
+ 				Interface:  v.Interface,
+ 			}
++		case slayers.SCMPTypePolarisProbeRequest:
++			v, ok := layer.(*slayers.SCMPPProbeRequest)
++			if !ok {
++				return serrors.New("invalid SCMP packet",
++					"scmp.type", scmpLayer.TypeCode,
++					"payload.type", common.TypeOf(layer))
++			}
++			p.Payload = SCMPPProbeRequest{
++				NextHdr:           v.NextHeader,
++				ExtLen:            v.ExtLen,
++				RequestIdentifier: v.RequestIdentifier,
++				SequenceNumber:    v.SequenceNumber,
++				CumQueuingDelay:   v.CumQueuingDelay,
++				ASIdentifier:      v.ASIdentifier,
++				InterfaceID:       v.InterfaceID,
++				BottleneckShare:   v.BottleneckShare,
++			}
++		case slayers.SCMPTypePolarisCongestionAlert:
++			v, ok := layer.(*slayers.SCMPPCongestionAlert)
++			if !ok {
++				return serrors.New("invalid SCMP packet",
++					"scmp.type", scmpLayer.TypeCode,
++					"payload.type", common.TypeOf(layer))
++			}
++			p.Payload = SCMPPCongestionAlert{
++				RequestIdentifier: v.RequestIdentifier,
++				SequenceNumber:    v.SequenceNumber,
++				ASIdentifier:      v.ASIdentifier,
++				InterfaceID:       v.InterfaceID,
++			}
+ 		default:
+ 			return serrors.New("unhandled SCMP type", "type", scmpLayer.TypeCode, "src", p.Source)
+ 		}
+diff --git a/router/BUILD.bazel b/router/BUILD.bazel
+index a7f08c725..64fc47f16 100644
+--- a/router/BUILD.bazel
++++ b/router/BUILD.bazel
+@@ -14,6 +14,10 @@ go_library(
+     importpath = "github.com/scionproto/scion/router",
+     visibility = ["//visibility:public"],
+     deps = [
++        "//pkg/daemon:go_default_library",
++        "//pkg/snet:go_default_library",
++        "//private/app/flag:go_default_library",
++        "//private/tracing:go_default_library",
+         "//pkg/addr:go_default_library",
+         "//pkg/drkey:go_default_library",
+         "//pkg/experimental/epic:go_default_library",
+@@ -39,6 +43,7 @@ go_library(
+         "//router/control:go_default_library",
+         "@com_github_gopacket_gopacket//:go_default_library",
+         "@com_github_gopacket_gopacket//layers:go_default_library",
++        "@com_github_x448_float16//:go_default_library",
+         "@com_github_prometheus_client_golang//prometheus:go_default_library",
+         "@com_github_prometheus_client_golang//prometheus/promauto:go_default_library",
+     ],
+@@ -74,6 +79,7 @@ go_test(
+         "@com_github_golang_mock//gomock:go_default_library",
+         "@com_github_gopacket_gopacket//:go_default_library",
+         "@com_github_gopacket_gopacket//layers:go_default_library",
++        "@com_github_x448_float16//:go_default_library",
+         "@com_github_stretchr_testify//assert:go_default_library",
+         "@com_github_stretchr_testify//require:go_default_library",
+     ],
+diff --git a/router/dataplane.go b/router/dataplane.go
+index 3fe15130b..6ba22e534 100644
+--- a/router/dataplane.go
++++ b/router/dataplane.go
+@@ -33,6 +33,9 @@ import (
+ 	"github.com/gopacket/gopacket"
+ 	"github.com/gopacket/gopacket/layers"
+ 	"github.com/prometheus/client_golang/prometheus"
++	"github.com/x448/float16"
++
++	//         "@com_github_x448_float16//:go_default_library",
+ 
+ 	"github.com/scionproto/scion/pkg/addr"
+ 	"github.com/scionproto/scion/pkg/drkey"
+@@ -212,8 +215,26 @@ type dataPlane struct {
+ 	// returned to the pool. To reduce the cost of copying, the packet structure is passed by
+ 	// reference.
+ 	packetPool chan *Packet
++
++	// create a hash set of all the paths that are currently in use.
++
++	// added variables ----------------------------------------------------
++	ConnectionSSet     *ConcurrentSet
++	Bandwith           uint64
++	processorQueueSize int
++	ProcsQs            []chan *Packet
++	slowQs             []chan *Packet
++}
++
++// --------------------------------- Added structures ----------------------------------
++type ConcurrentSet struct {
++	mu    sync.Mutex
++	set   map[string]struct{}
++	count atomic.Uint64
+ }
+ 
++// -------------------------------------------------------------------------------------
++
+ var (
+ 	alreadySet                    = errors.New("already set")
+ 	invalidSrcIA                  = errors.New("invalid source ISD-AS")
+@@ -589,6 +610,7 @@ type RunConfig struct {
+ 
+ func (d *dataPlane) Run(ctx context.Context) error {
+ 	d.mtx.Lock()
++	log.Debug("Starting data plane")
+ 	if len(d.interfaces) == 0 {
+ 		// Not stritcly an error but we really can't do anything; most maps aren't even allocated,
+ 		// due to lazy initialization.
+@@ -612,6 +634,29 @@ func (d *dataPlane) Run(ctx context.Context) error {
+ 	d.setRunning()
+ 	d.underlay.Start(ctx, d.packetPool, procQs)
+ 
++	// Initialize the stats for Polaris
++	d.initializePolaris()
++	d.processorQueueSize = processorQueueSize
++	d.ProcsQs = procQs
++	d.slowQs = slowQs
++
++	// could also monitor the queues to send a Congestion Alter if the BR is congested
++	// d.monitorCongestionStatus()
++
++	// create a goroutine that resets the packet pool every second
++	go func() {
++		ticker := time.NewTicker(time.Second * 1)
++		defer ticker.Stop()
++
++		for {
++			select {
++			case <-ticker.C:
++				d.ConnectionSSet.resetPacketPool()
++				// log.Debug("Reset packet pool")
++			}
++		}
++	}()
++
+ 	for i := 0; i < d.RunConfig.NumProcessors; i++ {
+ 		go func(i int) {
+ 			defer log.HandlePanic()
+@@ -624,9 +669,10 @@ func (d *dataPlane) Run(ctx context.Context) error {
+ 			d.runSlowPathProcessor(i, slowQs[i])
+ 		}(i)
+ 	}
+-
++	log.Debug("Started all processors")
+ 	d.mtx.Unlock()
+ 	<-ctx.Done()
++	log.Debug("Exciting data plane run function.")
+ 	return nil
+ }
+ 
+@@ -638,6 +684,7 @@ func (d *dataPlane) initPacketPool(processorQueueSize int) {
+ 		len(d.interfaces)*(2*d.RunConfig.BatchSize)
+ 
+ 	log.Debug("Initialize packet pool of size", "poolSize", poolSize)
++	log.Debug("Setting this message as a test.")
+ 	d.packetPool = make(chan *Packet, poolSize)
+ 	pktBuffers := make([][bufSize]byte, poolSize)
+ 	pktStructs := make([]Packet, poolSize)
+@@ -668,6 +715,504 @@ func (d *dataPlane) returnPacketToPool(pkt *Packet) {
+ 	d.packetPool <- pkt
+ }
+ 
++// ---------------------------------- added functions ----------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++// -------------------------------------------------------------------------------------
++
++func PolarisPacket(lastlayer gopacket.DecodingLayer) bool {
++	// This function checks, wether a packet is a Polaris packed and therefor needs to be processed differently
++	scmpPayload := lastlayer.LayerPayload()
++	var scmpHeader slayers.SCMP
++	err := scmpHeader.DecodeFromBytes(scmpPayload, gopacket.NilDecodeFeedback)
++	if err != nil {
++		log.Debug("Parsing SCMP header", "err", err)
++		return false
++	}
++
++	if scmpHeader.TypeCode != slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisProbeRequest, 0) {
++		log.Debug("Packet with router alert, but not polaris probe request", "type_code", scmpHeader.TypeCode)
++		return false
++	}
++
++	// var scmpPp slayers.SCMPPProbeRequest
++	// if err := scmpPp.DecodeFromBytes(scmpHeader.Payload, gopacket.NilDecodeFeedback); err != nil {
++	// 	// log.Debug("Parsing SCMPProbeRequest", "err", err)
++	// 	// also check for Congestion alert
++	// 	// var scmPPCA slayers.SCMPPCongestionAlert
++	// 	// if err := scmPPCA.DecodeFromBytes(scmpHeader.Payload, gopacket.NilDecodeFeedback); err != nil {
++	// 	// 	log.Debug("Parsing SCMPPCongestionAlert", "err", err)
++	// 	// 	return false
++	// 	// }
++	// 	return false
++	// }
++	return true
++}
++
++func (p *slowPathPacketProcessor) processPolarisPacket() error {
++	// process the polaris packet and then forward it
++	scmpPayload := p.lastLayer.LayerPayload()
++	var scmpHeader slayers.SCMP
++	err := scmpHeader.DecodeFromBytes(scmpPayload, gopacket.NilDecodeFeedback)
++	if err != nil {
++		log.Debug("Parsing SCMP header", "err", err)
++		return err
++	}
++
++	if scmpHeader.TypeCode != slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisProbeRequest, 0) {
++		log.Debug("Packet with router alert, but not polaris probe request", "type_code", scmpHeader.TypeCode)
++		return err
++	}
++
++	var scmpPp slayers.SCMPPProbeRequest
++	var scmPPCA slayers.SCMPPCongestionAlert
++	errPp := scmpPp.DecodeFromBytes(scmpHeader.Payload, gopacket.NilDecodeFeedback)
++	errPCA := scmPPCA.DecodeFromBytes(scmpHeader.Payload, gopacket.NilDecodeFeedback)
++	if errPp != nil && errPCA != nil {
++		log.Debug("Parsing SCMPProbeRequest or SCMPPCA failed:", "err", errPp)
++		return err
++	}
++	if errPp == nil {
++		log.Debug("SCMPProbeRequest", "payload", scmpPp)
++
++		totalBandwith, activeLinks, totalQueuingDelay := p.d.calculateMetrics()
++
++		if p.d.isCongested() {
++			// now we have to return a Congestion Alert
++			log.Debug("Congestion detected, sending Congestion Alert")
++			scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisCongestionAlert, 0)
++			scmpPCA := slayers.SCMPPCongestionAlert{
++				InterfaceID:       p.pkt.Ingress,
++				ASIdentifier:      p.d.localIA,
++				SequenceNumber:    scmpPp.SequenceNumber,
++				RequestIdentifier: scmpPp.RequestIdentifier,
++			}
++			return p.packPolarisCongestionAlert(scmpPCA, scmpHeader)
++		}
++
++		BottleneckShare := scmpPp.BottleneckShare
++		currentBottleneckShare_tmp := float32(totalBandwith) / float32(activeLinks+1)
++		currentBottleneckShare := float16.Fromfloat32(currentBottleneckShare_tmp)
++		log.Debug("Current bottleneck share", "currentBottleneckShare", currentBottleneckShare)
++		log.Debug("Bottleneck share", "BottleneckShare", BottleneckShare)
++		log.Debug("Total Bandwidth", "totalBandwith", totalBandwith)
++		log.Debug("Active Links", "activeLinks", activeLinks)
++
++		if currentBottleneckShare < BottleneckShare {
++			scmpPp.BottleneckShare = currentBottleneckShare
++			scmpPp.InterfaceID = p.pkt.Ingress
++			scmpPp.ASIdentifier = p.d.localIA
++		}
++
++		CumQueuingDelay := scmpPp.CumQueuingDelay
++		totalQueuingDelay_f16 := float16.Fromfloat32(totalQueuingDelay)
++		final_QueingDelay := float16.Fromfloat32(totalQueuingDelay_f16.Float32() + CumQueuingDelay.Float32())
++		scmpPp.CumQueuingDelay = final_QueingDelay
++		log.Debug("CumQueuingDelay", "CumQueuingDelay", CumQueuingDelay)
++		log.Debug("Total Queuing Delay", "totalQueuingDelay", totalQueuingDelay)
++		log.Debug("Final Queuing Delay", "final_QueingDelay", final_QueingDelay)
++
++		// check if the packet is from the last AS router
++		isLast := p.scionLayer.DstIA == p.d.localIA
++
++		if isLast {
++
++			// have to send back an echo response to the originator
++			log.Debug("Last AS router, sending echo response")
++			return p.packPolarisPacket(scmpPp, scmpHeader, true)
++		}
++		log.Debug("SCMPProbeRequest after change", "payload", scmpPp)
++		return p.packPolarisPacket(scmpPp, scmpHeader, false)
++
++	} else if errPCA == nil {
++		// This possiblity is not yet impelmented
++		log.Debug("Decoded SCMPPCongestionAlert", "packet", scmPPCA)
++
++	} else {
++		log.Debug("This should never be reached.")
++		return errPp
++	}
++	return nil
++}
++
++func (d *dataPlane) calculateMetrics() (totalBandwidth uint64, activeLinks uint64, totalQueuingDelay float32) {
++	totalQueuingDelay = float32(1.11) // quick palceholder not yet finished!!!!! Temporary!!!!
++	totalBandwidth = d.Bandwith
++	activeLinks = d.ConnectionSSet.Count()
++	return totalBandwidth, activeLinks, totalQueuingDelay
++}
++
++func (d *dataPlane) isCongested() bool {
++	threshhold := 0.8
++	tmp := 0
++	for _, q := range d.ProcsQs {
++		tmp += len(q)
++	}
++	for _, q := range d.slowQs {
++		tmp += len(q)
++	}
++	currentSize := float64(tmp)
++	totalSize := float64(d.RunConfig.NumProcessors*d.processorQueueSize + d.RunConfig.NumSlowPathProcessors*d.processorQueueSize)
++	log.Debug("Congestion status", "currentSize", currentSize, "totalSize", totalSize)
++	log.Debug("Congestion status", "threshhold", threshhold)
++	log.Debug("Congestion status", "currentSize/totalSize", currentSize/totalSize)
++	return currentSize/totalSize > threshhold
++}
++
++func (p *slowPathPacketProcessor) packPolarisPacket(scmpPp slayers.SCMPPProbeRequest, scmpHeader slayers.SCMP, lastRouter bool) error {
++
++	// create new SCION header for reply.
++	if lastRouter {
++		scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypeEchoReply, 0)
++		typ := slayers.SCMPTypeEchoReply
++		code := scmpHeader.TypeCode.Code()
++
++		echoReply := slayers.SCMPEcho{
++			Identifier: scmpPp.RequestIdentifier,
++			SeqNumber:  scmpPp.SequenceNumber,
++		}
++
++		log.Debug("echo reply", "payload", echoReply)
++
++		log.Debug("Last router, sending echo response")
++		srcAdd, err := p.scionLayer.SrcAddr()
++		if err != nil {
++			log.Debug("Parsing source address", "err", err)
++			return serrors.JoinNoStack(cannotRoute, err, "details", "parsing source address")
++		}
++		log.Debug("Sending response to: ", "destination", p.scionLayer.SrcIA, "destination addr type", p.scionLayer.SrcAddrType, "destination addr", p.scionLayer.RawSrcAddr, "destination address", srcAdd)
++
++		var path *scion.Raw
++		var ok bool
++		path, ok = p.scionLayer.Path.(*scion.Raw)
++		if !ok {
++			return serrors.JoinNoStack(cannotRoute, nil, "details", "unsupported path type", "path type", p.scionLayer.Path.Type())
++		}
++
++		decPath, err := path.ToDecoded()
++		if err != nil {
++			return serrors.JoinNoStack(cannotRoute, err, "details", "decoding raw path")
++		}
++		revPathTmp, err := decPath.Reverse()
++		if err != nil {
++			return serrors.JoinNoStack(cannotRoute, err, "details", "reversing path for SCMP")
++		}
++		revPath := revPathTmp.(*scion.Decoded)
++
++		peering, err := determinePeer(revPath.PathMeta, revPath.InfoFields[revPath.PathMeta.CurrINF])
++		if err != nil {
++			return serrors.JoinNoStack(cannotRoute, err, "details", "peering cannot be determined")
++		}
++
++		// Revert potential path segment switches that were done during processing.
++		if revPath.IsXover() && !peering {
++			// An effective cross-over is a change of segment other than at
++			// a peering hop.
++			if err := revPath.IncPath(); err != nil {
++				return serrors.JoinNoStack(cannotRoute, err,
++					"details", "reverting cross over for SCMP")
++			}
++		}
++		// If the packet is sent to an external router, we need to increment the
++		// path to prepare it for the next hop.
++		// This is an SCMP response to pkt, so egress will be pkt.Ingress.
++		if p.d.interfaces[p.pkt.Ingress].Scope() == External {
++			infoField := &revPath.InfoFields[revPath.PathMeta.CurrINF]
++			if infoField.ConsDir && !peering {
++				hopField := revPath.HopFields[revPath.PathMeta.CurrHF]
++				infoField.UpdateSegID(hopField.Mac)
++			}
++			if err := revPath.IncPath(); err != nil {
++				return serrors.JoinNoStack(cannotRoute, err,
++					"details", "incrementing path for SCMP")
++			}
++		}
++
++		// create new SCION header for reply.
++		var scionL slayers.SCION
++		scionL.FlowID = p.scionLayer.FlowID
++		scionL.TrafficClass = p.scionLayer.TrafficClass
++		scionL.PathType = revPath.Type()
++		scionL.Path = revPath
++		scionL.DstIA = p.scionLayer.SrcIA
++		scionL.SrcIA = p.d.localIA
++		scionL.DstAddrType = p.scionLayer.SrcAddrType
++		scionL.RawDstAddr = p.scionLayer.RawSrcAddr
++		scionL.NextHdr = slayers.L4SCMP
++
++		if err := scionL.SetSrcAddr(addr.HostIP(p.d.internalIP)); err != nil {
++			return serrors.JoinNoStack(cannotRoute, err, "details", "setting src addr")
++		}
++		typeCode := slayers.CreateSCMPTypeCode(typ, code)
++		scmpH := slayers.SCMP{TypeCode: typeCode}
++		scmpH.SetNetworkLayerForChecksum(&scionL)
++
++		serBuf := newSerializeProxy(p.pkt.RawPacket) // Prepend-only by default. It's all we need.
++		sopts := gopacket.SerializeOptions{
++			ComputeChecksums: true,
++			FixLengths:       true,
++		}
++		// First write the SCMP message only without the SCION header(s) to get a buffer that we
++		// can (re-)use as input in the MAC computation. Note that we move the quoted part of the packet
++		// to the end of the buffer (go supports overlaps properly).
++		// TODO(jiceatscion): in the future we may be able to leave room at the head of the
++		// buffer on ingest, so we won't need to move the quote at all.
++		// err = gopacket.SerializeLayers(&serBuf, sopts, &scmpH, &echoReply, gopacket.Payload(quote))
++		err = gopacket.SerializeLayers(&serBuf, sopts, &scmpH, &echoReply, &scmpPp)
++		if err != nil {
++			return serrors.JoinNoStack(cannotRoute, err, "details", "serializing SCMP message")
++		}
++		if err := scionL.SerializeTo(&serBuf, sopts); err != nil {
++			return serrors.JoinNoStack(cannotRoute, err, "details", "serializing SCION header")
++		}
++
++		p.pkt.RawPacket = serBuf.Bytes()
++
++		log.Debug("SCMP", "typecode", scmpH.TypeCode)
++
++		p.pkt.trafficType = ttOther
++		p.pkt.egress = p.pkt.Ingress
++		updateNetAddrFromNetAddr(p.pkt.DstAddr, p.pkt.SrcAddr)
++
++	} else {
++		// works currently, might not be the most efficient way
++		typ := scmpHeader.TypeCode.Type()
++		code := scmpHeader.TypeCode.Code()
++
++		var scionL slayers.SCION
++		scionL.FlowID = p.scionLayer.FlowID
++		scionL.TrafficClass = p.scionLayer.TrafficClass
++		scionL.PathType = p.scionLayer.PathType
++		scionL.Path = p.scionLayer.Path
++		scionL.DstIA = p.scionLayer.DstIA
++		scionL.SrcIA = p.scionLayer.SrcIA
++		scionL.DstAddrType = p.scionLayer.DstAddrType
++		scionL.RawDstAddr = p.scionLayer.RawDstAddr
++		scionL.NextHdr = slayers.L4SCMP
++		scrAddr, err := p.scionLayer.SrcAddr()
++		if err != nil {
++			log.Debug("Parsing source address", "err", err)
++			return serrors.JoinNoStack(cannotRoute, err, "details", "parsing source address")
++		}
++
++		scionL.SetSrcAddr(scrAddr)
++
++		typeCode := slayers.CreateSCMPTypeCode(typ, code)
++		scmpH := slayers.SCMP{TypeCode: typeCode}
++		scmpH.SetNetworkLayerForChecksum(&scionL)
++		// scmpHeader.SetNetworkLayerForChecksum(&p.scionLayer)
++
++		if scmpHeader.TypeCode.Type() == slayers.SCMPTypePolarisProbeRequest {
++			log.Debug("Polaris Probe Reply detected.")
++			log.Debug("SCMP", "typecode", scmpHeader.TypeCode)
++		}
++
++		// no authentication for Polaris messages. Has some more code if so
++
++		var quote []byte
++
++		// Polaris messages are not error messages. Has some more code if so
++
++		serBuf := newSerializeProxy(p.pkt.RawPacket) // Prepend-only by default. It's all we need.
++		sopts := gopacket.SerializeOptions{
++			ComputeChecksums: true,
++			FixLengths:       true,
++		}
++
++		err = gopacket.SerializeLayers(&serBuf, sopts, &scmpH, &scmpPp, gopacket.Payload(quote))
++		if err != nil {
++			return serrors.JoinNoStack(cannotRoute, err, "details", "serializing SCMP message")
++		}
++
++		// We do not use Authentication
++		scionL.NextHdr = slayers.L4SCMP
++
++		if err := p.scionLayer.SerializeTo(&serBuf, sopts); err != nil {
++			return serrors.JoinNoStack(cannotRoute, err, "details", "serializing SCION header")
++		}
++		p.pkt.RawPacket = serBuf.Bytes()
++
++		log.Debug("SCMP", "typecode", scmpHeader.TypeCode)
++	}
++
++	return nil
++}
++
++func (p *slowPathPacketProcessor) packPolarisCongestionAlert(scmpPCA slayers.SCMPPCongestionAlert, scmpHeader slayers.SCMP) error {
++	scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisCongestionAlert, 0)
++	typ := slayers.SCMPTypePolarisCongestionAlert
++	code := scmpHeader.TypeCode.Code()
++
++	var path *scion.Raw
++	var ok bool
++	path, ok = p.scionLayer.Path.(*scion.Raw)
++	if !ok {
++		return serrors.JoinNoStack(cannotRoute, nil, "details", "unsupported path type", "path type", p.scionLayer.Path.Type())
++	}
++
++	decPath, err := path.ToDecoded()
++	if err != nil {
++		return serrors.JoinNoStack(cannotRoute, err, "details", "decoding raw path")
++	}
++	revPathTmp, err := decPath.Reverse()
++	if err != nil {
++		return serrors.JoinNoStack(cannotRoute, err, "details", "reversing path for SCMP")
++	}
++	revPath := revPathTmp.(*scion.Decoded)
++
++	peering, err := determinePeer(revPath.PathMeta, revPath.InfoFields[revPath.PathMeta.CurrINF])
++	if err != nil {
++		return serrors.JoinNoStack(cannotRoute, err, "details", "peering cannot be determined")
++	}
++
++	// Revert potential path segment switches that were done during processing.
++	if revPath.IsXover() && !peering {
++		// An effective cross-over is a change of segment other than at
++		// a peering hop.
++		if err := revPath.IncPath(); err != nil {
++			return serrors.JoinNoStack(cannotRoute, err,
++				"details", "reverting cross over for SCMP")
++		}
++	}
++	// If the packet is sent to an external router, we need to increment the
++	// path to prepare it for the next hop.
++	// This is an SCMP response to pkt, so egress will be pkt.Ingress.
++	if p.d.interfaces[p.pkt.Ingress].Scope() == External {
++		infoField := &revPath.InfoFields[revPath.PathMeta.CurrINF]
++		if infoField.ConsDir && !peering {
++			hopField := revPath.HopFields[revPath.PathMeta.CurrHF]
++			infoField.UpdateSegID(hopField.Mac)
++		}
++		if err := revPath.IncPath(); err != nil {
++			return serrors.JoinNoStack(cannotRoute, err,
++				"details", "incrementing path for SCMP")
++		}
++	}
++
++	// create new SCION header for reply.
++	var scionL slayers.SCION
++	scionL.FlowID = p.scionLayer.FlowID
++	scionL.TrafficClass = p.scionLayer.TrafficClass
++	scionL.PathType = revPath.Type()
++	scionL.Path = revPath
++	scionL.DstIA = p.scionLayer.SrcIA
++	scionL.SrcIA = p.d.localIA
++	scionL.DstAddrType = p.scionLayer.SrcAddrType
++	scionL.RawDstAddr = p.scionLayer.RawSrcAddr
++	scionL.NextHdr = slayers.L4SCMP
++
++	if err := scionL.SetSrcAddr(addr.HostIP(p.d.internalIP)); err != nil {
++		return serrors.JoinNoStack(cannotRoute, err, "details", "setting src addr")
++	}
++	typeCode := slayers.CreateSCMPTypeCode(typ, code)
++	scmpH := slayers.SCMP{TypeCode: typeCode}
++	scmpH.SetNetworkLayerForChecksum(&scionL)
++
++	serBuf := newSerializeProxy(p.pkt.RawPacket) // Prepend-only by default. It's all we need.
++	sopts := gopacket.SerializeOptions{
++		ComputeChecksums: true,
++		FixLengths:       true,
++	}
++	// First write the SCMP message only without the SCION header(s) to get a buffer that we
++	// can (re-)use as input in the MAC computation. Note that we move the quoted part of the packet
++	// to the end of the buffer (go supports overlaps properly).
++	// TODO(jiceatscion): in the future we may be able to leave room at the head of the
++	// buffer on ingest, so we won't need to move the quote at all.
++	// err = gopacket.SerializeLayers(&serBuf, sopts, &scmpH, &echoReply, gopacket.Payload(quote))
++	err = gopacket.SerializeLayers(&serBuf, sopts, &scmpH, &scmpPCA)
++	if err != nil {
++		return serrors.JoinNoStack(cannotRoute, err, "details", "serializing SCMP message")
++	}
++	if err := scionL.SerializeTo(&serBuf, sopts); err != nil {
++		return serrors.JoinNoStack(cannotRoute, err, "details", "serializing SCION header")
++	}
++
++	p.pkt.RawPacket = serBuf.Bytes()
++
++	log.Debug("SCMP", "typecode", scmpH.TypeCode)
++
++	p.pkt.trafficType = ttOther
++	p.pkt.egress = p.pkt.Ingress
++	updateNetAddrFromNetAddr(p.pkt.DstAddr, p.pkt.SrcAddr)
++	return nil
++}
++
++func (d *dataPlane) initializePolaris() {
++	// Initialize the Polaris packet processor
++	// calcualte the bandwith of the links
++	// current bandwidth as long as no better way
++	d.Bandwith = 1000
++
++	d.ConnectionSSet = NewConcurrentSet()
++
++	return
++}
++
++// creates a concurrent set that can be used to track the flows
++func NewConcurrentSet() *ConcurrentSet {
++	return &ConcurrentSet{
++		set: make(map[string]struct{}),
++	}
++}
++
++// Add a string to the set, increment counter if it was new
++func (cs *ConcurrentSet) Add(s string) {
++	cs.mu.Lock()
++	defer cs.mu.Unlock()
++
++	if _, exists := cs.set[s]; !exists {
++		cs.set[s] = struct{}{}
++		cs.count.Add(1)
++	}
++}
++
++// Get the number of unique strings added
++func (cs *ConcurrentSet) Count() uint64 {
++	return cs.count.Load()
++}
++
++// reset the counter and the HashSet
++func (cs *ConcurrentSet) resetPacketPool() {
++	cs.mu.Lock()
++	defer cs.mu.Unlock()
++	cs.count.Store(0)
++	cs.set = make(map[string]struct{})
++}
++
++func (d *dataPlane) monitorCongestionStatus() {
++	go func() {
++		ticker := time.NewTicker(time.Second * 1)
++		defer ticker.Stop()
++
++		for {
++			select {
++			case <-ticker.C:
++				for i, q := range d.ProcsQs {
++					log.Debug("Processor queue size", "queue", i, "current size", len(q), "capacity", cap(q))
++				}
++				for i, q := range d.slowQs {
++					log.Debug("Slow path queue size", "queue", i, "current size", len(q), "capacity", cap(q))
++				}
++			}
++		}
++	}()
++}
++
++// --------------------------------------------------------------------------------
++// --------------------------------------------------------------------------------
++// --------------------------------------------------------------------------------
++// --------------------------------------------------------------------------------
++// --------------------------------------------------------------------------------
++
+ func (d *dataPlane) runProcessor(id int, q <-chan *Packet, slowQ chan<- *Packet) {
+ 
+ 	log.Debug("Initialize processor with", "id", id)
+@@ -679,6 +1224,29 @@ func (d *dataPlane) runProcessor(id int, q <-chan *Packet, slowQ chan<- *Packet)
+ 		}
+ 		disp := processor.processPkt(p)
+ 
++		packetSave := scionPacketProcessor{}
++		erro := error(nil)
++		packetSave.lastLayer, erro = decodeLayers(p.RawPacket, &packetSave.scionLayer, &packetSave.hbhLayer, &packetSave.e2eLayer)
++
++		if erro != nil {
++			log.Debug("Error occured while processing packet.", "err", erro)
++		}
++
++		srcAddr, err := packetSave.scionLayer.SrcAddr()
++		if err != nil {
++			log.Debug("Parsing source address", "err", err)
++		}
++		dstAddr, err := packetSave.scionLayer.DstAddr()
++		if err != nil {
++			log.Debug("Parsing destination address", "err", err)
++		}
++		flowIdentifier := srcAddr.String() + " " + packetSave.scionLayer.SrcIA.String() + " " +
++			dstAddr.String() + " " + packetSave.scionLayer.DstIA.String()
++		// add the flow identifier to the set
++		d.ConnectionSSet.Add(flowIdentifier)
++
++		packetSave.scionLayer.SrcAddr()
++
+ 		sc := ClassOfSize(len(p.RawPacket))
+ 		metrics := d.forwardingMetrics[p.Ingress][sc]
+ 		metrics.ProcessedPackets.Inc()
+@@ -686,8 +1254,10 @@ func (d *dataPlane) runProcessor(id int, q <-chan *Packet, slowQ chan<- *Packet)
+ 		switch disp {
+ 		case pForward:
+ 			// Normal processing proceeds.
++			// log.Debug("Normal processing.")
+ 		case pSlowPath:
+ 			// Not an error, processing continues on the slow path.
++			// log.Debug("Slow path processing.")
+ 			select {
+ 			case slowQ <- p:
+ 			default:
+@@ -699,6 +1269,7 @@ func (d *dataPlane) runProcessor(id int, q <-chan *Packet, slowQ chan<- *Packet)
+ 			d.returnPacketToPool(p)
+ 			continue
+ 		case pDiscard: // Everything else
++			// log.Debug("Discarding packet")
+ 			metrics.DroppedPacketsInvalid.Inc()
+ 			d.returnPacketToPool(p)
+ 			continue
+@@ -715,6 +1286,7 @@ func (d *dataPlane) runProcessor(id int, q <-chan *Packet, slowQ chan<- *Packet)
+ 			continue
+ 		}
+ 		if !fwLink.Send(p) {
++			log.Debug("Failed to send packet", "packet", p)
+ 			d.returnPacketToPool(p)
+ 			metrics.DroppedPacketsBusyForwarder.Inc()
+ 		}
+@@ -741,7 +1313,6 @@ func (d *dataPlane) runSlowPathProcessor(id int, q <-chan *Packet) {
+ 		}
+ 		fwLink, ok := d.interfaces[p.egress]
+ 		if !ok {
+-			log.Debug("Error determining forwarder. Egress is invalid", "egress", p.egress)
+ 			d.returnPacketToPool(p)
+ 			continue
+ 		}
+@@ -787,6 +1358,9 @@ type slowPathPacketProcessor struct {
+ 
+ 	// DRKey key derivation for SCMP authentication
+ 	drkeyProvider drkeyProvider
++
++	// fields specific to polaris
++	isPolaris bool
+ }
+ 
+ func (p *slowPathPacketProcessor) reset() {
+@@ -804,6 +1378,7 @@ func (p *slowPathPacketProcessor) processPacket(pkt *Packet) error {
+ 	if err != nil {
+ 		return err
+ 	}
++
+ 	pathType := p.scionLayer.PathType
+ 	switch pathType {
+ 	case scion.PathType:
+@@ -827,6 +1402,17 @@ func (p *slowPathPacketProcessor) processPacket(pkt *Packet) error {
+ 	}
+ 
+ 	s := pkt.slowPathRequest
++	// log.Debug("Processing slow-path packet", "slowPathRequest", s)
++	// log.Debug("Processing slow-path packet", "s.typ", s.typ)
++	if PolarisPacket(p.lastLayer) {
++		s.typ = slowPathSCMP
++		s.scmpType = slayers.SCMPTypePolarisProbeRequest
++		s.code = 0 //might have to change it depending on what we want to do with the packet
++		log.Debug("Processing slow-path packet", "SCMP type", s.scmpType)
++		log.Debug("Processing slow-path packet", "SCMP code", s.code)
++		// log.Debug("Processing packet that goes to: ", "dst", pkt.DstAddr, "src", pkt.SrcAddr)
++	}
++
+ 	switch s.typ {
+ 	case slowPathSCMP: //SCMP
+ 		var layer gopacket.SerializableLayer
+@@ -841,6 +1427,11 @@ func (p *slowPathPacketProcessor) processPacket(pkt *Packet) error {
+ 		case slayers.SCMPTypeInternalConnectivityDown:
+ 			layer = &slayers.SCMPInternalConnectivityDown{IA: p.d.localIA,
+ 				Ingress: uint64(p.pkt.Ingress), Egress: uint64(p.pkt.egress)}
++		case slayers.SCMPTypePolarisProbeRequest:
++			log.Debug("Processing SCMP probe request")
++			layer = &slayers.SCMPPProbeRequest{}
++			// need to process the polaris packet
++			return p.processPolarisPacket()
+ 		}
+ 		return p.packSCMP(s.scmpType, s.code, layer, true)
+ 
+@@ -889,6 +1480,7 @@ func errorDiscard(ctx ...any) disposition {
+ 
+ func (p *scionPacketProcessor) processPkt(pkt *Packet) disposition {
+ 	if err := p.reset(); err != nil {
++		// log.Debug("Error resetting packet processor", "err", err)
+ 		return errorDiscard("error", err)
+ 	}
+ 	p.pkt = pkt
+@@ -897,33 +1489,44 @@ func (p *scionPacketProcessor) processPkt(pkt *Packet) disposition {
+ 	var err error
+ 	p.lastLayer, err = decodeLayers(pkt.RawPacket, &p.scionLayer, &p.hbhLayer, &p.e2eLayer)
+ 	if err != nil {
++		// log.Debug("Error decoding layers", "err", err)
+ 		return errorDiscard("error", err)
+ 	}
++	// log.Debug("Processing packet", "scionLayer", p.scionLayer, "hbhLayer", p.hbhLayer, "e2eLayer", p.e2eLayer)
+ 
+ 	pld := p.lastLayer.LayerPayload()
+ 
+ 	pathType := p.scionLayer.PathType
+ 	switch pathType {
+ 	case empty.PathType:
++		// log.Debug("Processing empty path type")
+ 		if p.lastLayer.NextLayerType() == layers.LayerTypeBFD {
+ 			return p.processIntraBFD(pld)
+ 		}
++		// log.Debug("Processing empty path type")
+ 		return errorDiscard("error", unsupportedPathTypeNextHeader)
+ 
+ 	case onehop.PathType:
++		// log.Debug("Processing onehop path type")
+ 		if p.lastLayer.NextLayerType() == layers.LayerTypeBFD {
+ 			ohp, ok := p.scionLayer.Path.(*onehop.Path)
+ 			if !ok {
++				// log.Debug("Error parsing onehop path", "err", err)
+ 				return errorDiscard("error", malformedPath)
+ 			}
+ 			return p.processInterBFD(ohp, pld)
+ 		}
+ 		return p.processOHP()
+ 	case scion.PathType:
++		// Traceroute is scion path type so also pprobe has to be
++		// log.Debug("Processing scion path type")
+ 		return p.processSCION()
+ 	case epic.PathType:
++		// log.Debug("Processing epic path type")
+ 		return p.processEPIC()
+ 	default:
++		// log.Debug("Processing unsupported path type", "pathType", pathType)
++		// log.Debug("Error processing unsupported path type")
+ 		return errorDiscard("error", unsupportedPathType)
+ 	}
+ }
+@@ -932,6 +1535,7 @@ func (p *scionPacketProcessor) processInterBFD(oh *onehop.Path, data []byte) dis
+ 
+ 	// If this is an inter-AS BFD, it can via an interface we own. So the ifID matches one link
+ 	// and the ifID better be valid. In the future that will be checked upstream from here.
++	log.Debug("Processing inter-BFD packet")
+ 	link, exists := p.d.interfaces[p.pkt.Ingress]
+ 	if !exists {
+ 		return errorDiscard("error", noBFDSessionFound)
+@@ -954,6 +1558,7 @@ func (p *scionPacketProcessor) processIntraBFD(data []byte) disposition {
+ 	// by srcAddress. We always find one. The internal link matches anything that is not known.
+ 	// TODO(multi_underlay): The underlay should find the Link for all packets (bfd or not), either
+ 	// by src address or by connection.
++	log.Debug("Processing intra-BFD packet")
+ 	src := p.pkt.SrcAddr.AddrPort() // POSSIBLY EXPENSIVE CONVERSION
+ 	session := p.d.underlay.Link(src).BFDSession()
+ 	if session == nil {
+@@ -973,6 +1578,7 @@ func (p *scionPacketProcessor) processSCION() disposition {
+ 
+ 	var ok bool
+ 	p.path, ok = p.scionLayer.Path.(*scion.Raw)
++	// log.Debug("Processing SCION packet, inside function processSCION", "path", p.path)
+ 	if !ok {
+ 		// TODO(lukedirtwalker) parameter problem invalid path?
+ 		return errorDiscard("error", malformedPath)
+@@ -1412,6 +2018,7 @@ func (p *scionPacketProcessor) verifyCurrentMAC() disposition {
+ }
+ 
+ func (p *scionPacketProcessor) resolveInbound() disposition {
++	// log.Debug("Resolveing inbound packet")
+ 	err := p.d.resolveLocalDst(p.pkt.DstAddr, p.scionLayer, p.lastLayer)
+ 
+ 	switch err {
+@@ -1549,6 +2156,7 @@ func (p *scionPacketProcessor) ingressRouterAlertFlag() *bool {
+ 
+ func (p *scionPacketProcessor) handleEgressRouterAlert() disposition {
+ 	alert := p.egressRouterAlertFlag()
++	// log.Debug("handleEgressRouterAlert", "alert", *alert) //for traceroute
+ 	if !*alert {
+ 		return pForward
+ 	}
+@@ -1639,49 +2247,131 @@ func (p *scionPacketProcessor) validateSrcHost() disposition {
+ 	return pSlowPath
+ }
+ 
++// debug scion packet processor
++// func debugScionPacketProcessor(p *scionPacketProcessor) {
++// 	// Get the type of the struct
++// 	t := reflect.TypeOf(*p)
++
++// 	// Print all fields (attributes)
++// 	fmt.Println("Attributes:")
++// 	for i := 0; i < t.NumField(); i++ {
++// 		field := t.Field(i)
++// 		fmt.Printf("  Name: %s, Type: %s\n", field.Name, field.Type)
++// 	}
++
++// 	// Print all methods
++// 	fmt.Println("\nMethods:")
++// 	for i := 0; i < t.NumMethod(); i++ {
++// 		method := t.Method(i)
++// 		fmt.Printf("  Name: %s, Type: %s\n", method.Name, method.Type)
++// 	}
++// }
++
++func (p *scionPacketProcessor) checkIfPolaris() disposition {
++	// Decode the SCION header and other layers
++	lastLayer, err := decodeLayers(p.pkt.RawPacket, &p.scionLayer, &p.hbhLayer, &p.e2eLayer)
++	// log.Debug("Decoded layers", "lastLayer", lastLayer, "err", err)
++	if err != nil {
++		log.Debug("Error decoding layers", "err", err)
++		return pDiscard
++	}
++	p.lastLayer = lastLayer
++
++	// Check if the packet is an SCMPPProbe
++	// log.Debug("Checking for SCMPPProbe")
++	if scmpLayer, ok := lastLayer.(*slayers.SCMP); ok {
++		log.Debug("SCMP layer detected", "type_code", scmpLayer.TypeCode)
++		log.Debug("SCMP layer detected", "type", scmpLayer.TypeCode.Type())
++		if scmpLayer.TypeCode.Type() == slayers.SCMPTypePolarisProbeRequest {
++			log.Debug("SCMPPProbe detected, marking for slow path")
++			p.pkt.slowPathRequest = slowPathRequest{
++				scmpType: slayers.SCMPTypePolarisProbeRequest,
++				code:     scmpLayer.TypeCode.Code(),
++			}
++			return pSlowPath
++		}
++		if scmpLayer.TypeCode.Type() == slayers.SCMPTypeTracerouteReply {
++			log.Debug("SCMPTracerouteReply detected, marking for slow path")
++			return pForward
++		}
++		if scmpLayer.TypeCode.Type() == slayers.SCMPTypeTracerouteRequest {
++			log.Debug("SCMPTracerouteRequest detected, marking for slow path")
++			return pForward
++		}
++	}
++	return pForward
++}
++
+ func (p *scionPacketProcessor) process() disposition {
++	// log.Debug("Processing SCION packet", "path", p)
++	// debugScionPacketProcessor(p)
++	// if disp := p.checkIfPolaris(); disp != pForward {
++	// 	// log.Debug("SCION packet check if polaris", "disp", disp)
++	// 	return disp
++	// }
+ 	if disp := p.parsePath(); disp != pForward {
++		// log.Debug("SCION packet parse path", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.determinePeer(); disp != pForward {
++		// log.Debug("SCION packet determine peer", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.validateHopExpiry(); disp != pForward {
++		// log.Debug("SCION packet validate hop expiry", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.validateIngressID(); disp != pForward {
++		// log.Debug("SCION packet validate ingress ID", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.validatePktLen(); disp != pForward {
++		// log.Debug("SCION packet validate pkt len", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.validateTransitUnderlaySrc(); disp != pForward {
++		// log.Debug("SCION packet validate transit underlay src", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.validateSrcDstIA(); disp != pForward {
++		// log.Debug("SCION packet validate src/dst IA", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.validateSrcHost(); disp != pForward {
++		// log.Debug("SCION packet validate src host", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.updateNonConsDirIngressSegID(); disp != pForward {
++		// log.Debug("SCION packet update non-cons dir ingress seg id", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.verifyCurrentMAC(); disp != pForward {
++		// log.Debug("SCION packet verify current MAC", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.handleIngressRouterAlert(); disp != pForward {
++		// log.Debug("SCION packet handle ingress router alert", "disp", disp)
+ 		return disp
+ 	}
+ 	// Inbound: pkt destined to the local IA.
+ 	if p.scionLayer.DstIA == p.d.localIA {
++		// We are the ingress router and if we go in construction direction we
++		// log.Debug("SCION packet resolve inbound", "DestIA.AS", p.scionLayer.DstIA.AS(), "localIA.AS", p.d.localIA.AS(), "DestIA.ISD", p.scionLayer.DstIA.ISD(), "localIA.ISD", p.d.localIA.ISD())
+ 		disp := p.resolveInbound()
+ 		if disp != pForward {
+ 			return disp
+ 		}
+ 		p.pkt.trafficType = ttIn
++		if p.lastLayer.NextLayerType() == slayers.LayerTypeSCMP {
++			if PolarisPacket(p.lastLayer) {
++				log.Debug("Polaris packet detected, marking for slow path")
++				log.Debug("----------------------------------------------")
++				return pSlowPath
++			}
++		}
+ 		return pForward
+ 	}
++	// log.Debug("No dispo")
+ 
+ 	// Outbound: pkt leaving the local IA. This Could be:
+ 	// * Pure outbound: from this AS, in via internal, out via external.
+@@ -1692,15 +2382,18 @@ func (p *scionPacketProcessor) process() disposition {
+ 		// An effective cross-over is a change of segment other than at
+ 		// a peering hop.
+ 		if disp := p.doXover(); disp != pForward {
++			// log.Debug("SCION packet do xover", "disp", disp)
+ 			return disp
+ 		}
+ 		// doXover() has changed the current segment and hop field.
+ 		// We need to validate the new hop field.
+ 		if disp := p.validateHopExpiry(); disp != pForward {
++			// log.Debug("SCION packet validate hop expiry", "disp", disp)
+ 			return disp
+ 		}
+ 		// verify the new block
+ 		if disp := p.verifyCurrentMAC(); disp != pForward {
++			// log.Debug("SCION packet verify current MAC", "disp", disp)
+ 			return disp
+ 		}
+ 	}
+@@ -1711,6 +2404,7 @@ func (p *scionPacketProcessor) process() disposition {
+ 	p.pkt.egress = egressID
+ 
+ 	if disp := p.validateEgressID(); disp != pForward {
++		// log.Debug("SCION packet validate egress ID", "disp", disp)
+ 		return disp
+ 	}
+ 
+@@ -1718,14 +2412,53 @@ func (p *scionPacketProcessor) process() disposition {
+ 	// send the reply anyway, so that trace route can pinpoint the exact link
+ 	// that failed.
+ 	if disp := p.handleEgressRouterAlert(); disp != pForward {
++		// log.Debug("SCION packet handle egress router alert", "disp", disp)
+ 		return disp
+ 	}
+ 	if disp := p.validateEgressUp(); disp != pForward {
++		// log.Debug("SCION packet validate egress up", "disp", disp)
+ 		return disp
+ 	}
++	// log.Debug("Before return of function process()", "trafficType", p.pkt.trafficType)
++	// if PolarisPacket(p.lastLayer) {
++	// 	log.Debug("Polaris packet detected, marking for slow path")
++	// 	log.Debug("Nexlayer of polaris packet", "nextLayer", p.lastLayer.NextLayerType())
++	// }
++
++	// check if the packet is a polaris probe if yes, send it to slow path
++	if p.lastLayer.NextLayerType() == slayers.LayerTypeSCMP {
++		if PolarisPacket(p.lastLayer) {
++			log.Debug("Polaris packet detected, marking for slow path")
++			log.Debug("----------------------------------------------")
++			if p.d.interfaces[egressID].Scope() == External {
++				// Not ASTransit in
++				if disp := p.processEgress(); disp != pForward {
++					// log.Debug("SCION packet process egress", "disp", disp)
++					log.Debug("Error processing egress!!!!!!!!!!!!!!!!!!!!!!!!!", "disp", disp)
++				}
++				// Finish deciding the trafficType...
++				var tt trafficType
++				if p.scionLayer.SrcIA == p.d.localIA {
++					// Pure outbound
++					tt = ttOut
++				} else if p.pkt.Ingress == 0 {
++					// ASTransit out
++					tt = ttOutTransit
++				} else {
++					// Therefore it is BRTransit
++					tt = ttBrTransit
++				}
++				p.pkt.trafficType = tt
++				return pSlowPath
++			}
++			p.pkt.trafficType = ttInTransit
++			return pSlowPath
++		}
++	}
+ 	if p.d.interfaces[egressID].Scope() == External {
+ 		// Not ASTransit in
+ 		if disp := p.processEgress(); disp != pForward {
++			// log.Debug("SCION packet process egress", "disp", disp)
+ 			return disp
+ 		}
+ 		// Finish deciding the trafficType...
+@@ -1747,6 +2480,7 @@ func (p *scionPacketProcessor) process() disposition {
+ 	// ASTransit in: pkt leaving this AS through another BR.
+ 	// We already know the egressID is valid. The packet can go straight to forwarding.
+ 	p.pkt.trafficType = ttInTransit
++
+ 	return pForward
+ }
+ 
+@@ -1903,6 +2637,7 @@ func (d *dataPlane) addEndhostPort(
+ 			return serrors.Wrap("decoding SCMP layer for extracting endhost dst port", err)
+ 		}
+ 		port, err = getDstPortSCMP(&scmpLayer)
++		// log.Debug("Port", "port", port)
+ 		if err != nil {
+ 			// TODO(JordiSubira): Treat this as a parameter problem.
+ 			return serrors.Wrap("getting dst port from SCMP message", err)
+@@ -1922,6 +2657,9 @@ func getDstPortSCMP(scmp *slayers.SCMP) (uint16, error) {
+ 	// XXX(JordiSubira): This implementation is far too slow for the dataplane.
+ 	// We should reimplement this with fewer helpers and memory allocations, since
+ 	// our sole goal is to parse the L4 port or identifier in the offending packets.
++	// if scmp.TypeCode.Type() == slayers.SCMPTypeEchoReply || scmp.TypeCode.Type() == slayers.SCMPTypeEchoRequest {
++	// 	log.Debug("msg", "SCMP echo reply/traceroute reply")
++	// }
+ 	if scmp.TypeCode.Type() == slayers.SCMPTypeEchoRequest ||
+ 		scmp.TypeCode.Type() == slayers.SCMPTypeTracerouteRequest {
+ 		return topology.EndhostPort, nil
+@@ -1943,6 +2681,16 @@ func getDstPortSCMP(scmp *slayers.SCMP) (uint16, error) {
+ 		return scmpTraceroute.Identifier, nil
+ 	}
+ 
++	if scmp.TypeCode.Type() == slayers.SCMPTypePolarisProbeRequest {
++		log.Debug("msg", "SCMP polaris probe request")
++		var scmpPolaris slayers.SCMPPProbeRequest
++		err := scmpPolaris.DecodeFromBytes(scmp.Payload, gopacket.NilDecodeFeedback)
++		if err != nil {
++			return 0, err
++		}
++		return scmpPolaris.RequestIdentifier, nil
++	}
++
+ 	// Drop unknown SCMP error messages.
+ 	if scmp.NextLayerType() == gopacket.LayerTypePayload {
+ 		return 0, serrors.New("unsupported SCMP error message",
+@@ -1953,6 +2701,8 @@ func getDstPortSCMP(scmp *slayers.SCMP) (uint16, error) {
+ 		return 0, err
+ 	}
+ 	if len(l) != 2 {
++		// log.Debug("msg", "invalid number of SCMP layers", "count", len(l))
++		// log.Debug("scmp nextlayertype", "nextlayertype", scmp.NextLayerType())
+ 		return 0, serrors.New("SCMP error message without payload")
+ 	}
+ 	gpkt := gopacket.NewPacket(*l[1].(*gopacket.Payload), slayers.LayerTypeSCION,
+@@ -2125,6 +2875,7 @@ func (b *bfdSend) Send(bfd *layers.BFD) error {
+ 		ohp.Info.Timestamp = uint32(time.Now().Unix() - 10)
+ 		ohp.FirstHop.Mac = path.MAC(b.mac, ohp.Info, ohp.FirstHop, b.macBuffer)
+ 	}
++	// log.Debug("Inside send function of bfdSend", "srcAddr", b.srcAddr, "dstAddr", b.dstAddr)
+ 
+ 	p := b.dataPlane.getPacketFromPool()
+ 	p.Reset()
+@@ -2141,6 +2892,7 @@ func (b *bfdSend) Send(bfd *layers.BFD) error {
+ 	// The useful part of the buffer is given by Bytes. We don't copy the bytes; just the slice's
+ 	// metadata.
+ 	p.RawPacket = serBuf.Bytes()
++	// log.Debug("Packet to be sent", "packet", p.RawPacket)
+ 
+ 	// BfdControllers and fwQs are initialized from the same set of ifIDs. So not finding
+ 	// the forwarding queue is an serious internal error. Let that panic.
+@@ -2250,6 +3002,13 @@ func (p *slowPathPacketProcessor) prepareSCMP(
+ 	scmpH := slayers.SCMP{TypeCode: typeCode}
+ 	scmpH.SetNetworkLayerForChecksum(&scionL)
+ 
++	// log.Debug("SCMP", "typecode", scmpH.TypeCode)
++	// log.Debug("Before Polaris if condition.")
++	if scmpH.TypeCode.Type() == slayers.SCMPTypePolarisProbeRequest {
++		log.Debug("Polaris Probe Reply detected.")
++		log.Debug("SCMP", "typecode", scmpH.TypeCode)
++	}
++
+ 	needsAuth := false
+ 	if p.d.ExperimentalSCMPAuthentication {
+ 		// Error messages must be authenticated.
+diff --git a/scion.sh b/scion.sh
+index a21b45b27..c6f194372 100755
+--- a/scion.sh
++++ b/scion.sh
+@@ -6,7 +6,7 @@ cmd_bazel-remote() {
+     mkdir -p "$HOME/.cache/bazel/remote"
+     uid=$(id -u)
+     gid=$(id -g)
+-    USER_ID="$uid" GROUP_ID="$gid" docker compose -f bazel-remote.yml up -d
++    USER_ID="$uid" GROUP_ID="$gid" docker-compose -f bazel-remote.yml up -d
+ }
+ 
+ cmd_topo-clean() {
+diff --git a/scion/cmd/scion/BUILD.bazel b/scion/cmd/scion/BUILD.bazel
+index bc845d5e0..fdbc21f52 100644
+--- a/scion/cmd/scion/BUILD.bazel
++++ b/scion/cmd/scion/BUILD.bazel
+@@ -13,6 +13,7 @@ go_library(
+         "ping.go",
+         "showpaths.go",
+         "traceroute.go",
++        "polaris.go",
+     ],
+     importpath = "github.com/scionproto/scion/scion/cmd/scion",
+     visibility = ["//visibility:private"],
+@@ -36,9 +37,11 @@ go_library(
+         "//scion/ping:go_default_library",
+         "//scion/showpaths:go_default_library",
+         "//scion/traceroute:go_default_library",
++        "//scion/polaris:go_default_library",
+         "@com_github_opentracing_opentracing_go//:go_default_library",
+         "@com_github_spf13_cobra//:go_default_library",
+         "@com_github_spf13_cobra//doc:go_default_library",
++        "@com_github_x448_float16//:go_default_library",
+         "@in_gopkg_yaml_v2//:go_default_library",
+     ],
+ )
+diff --git a/scion/cmd/scion/main.go b/scion/cmd/scion/main.go
+index 8c3018891..15ff305b7 100644
+--- a/scion/cmd/scion/main.go
++++ b/scion/cmd/scion/main.go
+@@ -56,6 +56,8 @@ func main() {
+ 		newTraceroute(cmd),
+ 		newAddress(cmd),
+ 		newGendocs(cmd),
++		newPProbe(cmd),
++		newPCA(cmd),
+ 	)
+ 	// This Templatefunc allows use some escape characters for the rst
+ 	// documentation conversion without compromising the readability of the help
+diff --git a/scion/cmd/scion/ping.go b/scion/cmd/scion/ping.go
+index 1db9204da..cfd447743 100644
+--- a/scion/cmd/scion/ping.go
++++ b/scion/cmd/scion/ping.go
+@@ -92,10 +92,10 @@ func newPing(pather CommandPather) *cobra.Command {
+ 
+ 	var cmd = &cobra.Command{
+ 		Use:   "ping [flags] <remote>",
+-		Short: "Test connectivity to a remote SCION host using SCMP echo packets",
++		Short: "Test connectivity to a remote SCION host using SCMP echo packets. Comment to see if it works",
+ 		Example: fmt.Sprintf(`  %[1]s ping 1-ff00:0:110,10.0.0.1
+   %[1]s ping 1-ff00:0:110,10.0.0.1 -c 5`, pather.CommandPath()),
+-		Long: fmt.Sprintf(`'ping' test connectivity to a remote SCION host using SCMP echo packets.
++		Long: fmt.Sprintf(`'ping' test connectivity to a remote SCION host using SCMP echo packets. Comment to see if it works.
+ 
+ When the \--count option is set, ping sends the specified number of SCMP echo packets
+ and reports back the statistics.
+@@ -139,6 +139,9 @@ On other errors, ping will exit with code 2.
+ 			)
+ 
+ 			span, traceCtx := tracing.CtxWith(context.Background(), "run")
++			log.Debug("Tracing enabled", "tracer", flags.tracer)
++			log.Debug("Context Background of span:", "Background", context.Background())
++
+ 			span.SetTag("dst.isd_as", remote.IA)
+ 			span.SetTag("dst.host", remote.Host.IP)
+ 			defer span.Finish()
+diff --git a/scion/cmd/scion/polaris.go b/scion/cmd/scion/polaris.go
+new file mode 100644
+index 000000000..5c4eb565e
+--- /dev/null
++++ b/scion/cmd/scion/polaris.go
+@@ -0,0 +1,424 @@
++// Enables the command to send Polaris specific SCMP messages
++// Needs to be similar to tracerout. Needs to be on the slowpahts as it need additional processing and can not be instantly forwarded
++
++package main
++
++// Modeled after the ping function
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net"
++	"net/netip"
++	"os"
++	"syscall"
++	"time"
++
++	"github.com/spf13/cobra"
++	"gopkg.in/yaml.v2"
++
++	"github.com/scionproto/scion/pkg/addr"
++	"github.com/scionproto/scion/pkg/daemon"
++	"github.com/scionproto/scion/pkg/log"
++	"github.com/scionproto/scion/pkg/private/serrors"
++	"github.com/scionproto/scion/pkg/snet"
++	"github.com/scionproto/scion/pkg/snet/addrutil"
++	"github.com/scionproto/scion/private/app"
++	"github.com/scionproto/scion/private/app/flag"
++	"github.com/scionproto/scion/private/app/path"
++	"github.com/scionproto/scion/private/path/pathpol"
++	"github.com/scionproto/scion/private/topology"
++	"github.com/scionproto/scion/private/tracing"
++	"github.com/scionproto/scion/scion/polaris"
++)
++
++// structure looks like the one from traceroute command
++func newPProbe(pather CommandPather) *cobra.Command {
++	var envFlags flag.SCIONEnvironment
++	var flags struct {
++		logLevel string
++		tracer   string
++		epic     bool
++		format   string
++	}
++
++	var cmd = &cobra.Command{
++		Use:     "pprobe [flags] <path>",
++		Short:   "Send a P-Probe SCMP message to a SCION address. Over a specified path.",
++		Example: "scion pprobe 1-ff00:0:111,10.150.0.71",
++		Long:    `Send a P-Probe SCMP message to a SCION address. Over a specified path.`,
++		Args:    cobra.ExactArgs(1),
++		RunE: func(cmd *cobra.Command, args []string) error {
++			remote, err := addr.ParseAddr(args[0])
++			if err != nil {
++				return serrors.Wrap("parsing remote", err)
++			}
++			if err := app.SetupLog(flags.logLevel); err != nil {
++				return serrors.Wrap("setting up logging", err)
++			}
++			closer, err := setupTracer("traceroute", flags.tracer)
++			if err != nil {
++				return serrors.Wrap("setting up tracing", err)
++			}
++			defer closer()
++			printf, err := getPrintf(flags.format, cmd.OutOrStdout())
++			log.Debug("Arguments to the function: %v\n", args)
++			log.Debug("Command: %v\n", cmd)
++			log.Debug("Flags: %v\n", flags)
++			if err != nil {
++				return serrors.Wrap("get formatting", err)
++			}
++			cmd.SilenceUsage = true
++
++			if err := envFlags.LoadExternalVars(); err != nil {
++				return err
++			}
++			daemonAddr := envFlags.Daemon()
++			localIP := net.IP(envFlags.Local().AsSlice())
++			log.Debug("Resolved SCION environment flags",
++				"daemon", daemonAddr,
++				"local", localIP,
++			)
++
++			span, traceCtx := tracing.CtxWith(context.Background(), "run")
++			log.Debug("span", "span", span)
++			log.Debug("traceCtx", "traceCtx", traceCtx)
++			span.SetTag("dst.isd_as", remote.IA)
++			span.SetTag("dst.host", remote.Host.IP)
++			defer span.Finish()
++
++			ctx, cancelF := context.WithTimeout(traceCtx, time.Second)
++			log.Debug("ctx", "ctx", ctx)
++			log.Debug("cancelF", "cancelF", cancelF)
++			defer cancelF()
++			sd, err := daemon.NewService(daemonAddr).Connect(ctx)
++			if err != nil {
++				return serrors.Wrap("connecting to SCION Daemon", err)
++			}
++			defer sd.Close()
++			log.Debug("Before loading topology")
++			topo, err := daemon.LoadTopology(ctx, sd)
++			log.Debug("After loading topology")
++			if err != nil {
++				return serrors.Wrap("loading topology", err)
++			}
++			span.SetTag("src.isd_as", topo.LocalIA)
++
++			log.Debug("Topology of sciond", "topo", topo)
++			// log.Debug("Remote address", "remote", remote)
++			// log.Debug("Local address", "local", localIP)
++			// log.Debug("topo error", "err", err)
++			path, err := path.Choose(traceCtx, sd, remote.IA,
++				path.WithEPIC(flags.epic),
++			)
++			if err != nil {
++				return err
++			}
++			nextHop := path.UnderlayNextHop()
++			if nextHop == nil {
++				nextHop = &net.UDPAddr{
++					IP:   remote.Host.IP().AsSlice(),
++					Port: topology.EndhostPort,
++					Zone: remote.Host.IP().Zone(),
++				}
++			}
++
++			if localIP == nil {
++				target := remote.Host.IP().AsSlice()
++				if nextHop != nil {
++					target = nextHop.IP
++				}
++				if localIP, err = addrutil.ResolveLocal(target); err != nil {
++					return serrors.Wrap("resolving local address", err)
++				}
++				printf("Resolved local address:\n  %s\n", localIP)
++			}
++			printf("Using path:\n  %s\n\n", path)
++
++			seq, err := pathpol.GetSequence(path)
++			if err != nil {
++				return serrors.New("get sequence from used path")
++			}
++			var res ResultTraceroute
++			res.Path = Path{
++				Fingerprint: snet.Fingerprint(path).String(),
++				Hops:        getHops(path),
++				Sequence:    seq,
++				LocalIP:     localIP,
++				NextHop:     path.UnderlayNextHop().String(),
++			}
++
++			span.SetTag("src.host", localIP)
++			asNetipAddr, ok := netip.AddrFromSlice(localIP)
++			if !ok {
++				panic("Invalid Local IP address")
++			}
++			local := addr.Addr{
++				IA:   topo.LocalIA,
++				Host: addr.HostIP(asNetipAddr),
++			}
++			ctx = app.WithSignal(traceCtx, os.Interrupt, syscall.SIGTERM)
++
++			var updates []polaris.Update
++			log.Debug("We are before the config of Pprobe Polaris")
++			cfg := polaris.Config{
++				Topology:     topo,
++				Remote:       remote,
++				NextHop:      nextHop,
++				MTU:          path.Metadata().MTU,
++				Local:        local,
++				PathEntry:    path,
++				ProbesPerHop: 3,
++				ErrHandler:   func(err error) { fmt.Fprintf(os.Stderr, "ERROR: %s\n", err) },
++				EPIC:         flags.epic,
++			}
++			log.Debug("Running Pprobe", "config", cfg)
++
++			response, err := polaris.Run(ctx, cfg)
++			if err != nil {
++				return err
++			}
++			res.Hops = make([]HopInfo, 0, len(updates))
++
++			if response.StructType == polaris.Empty {
++				return serrors.New("empty path is not allowed for traceroute")
++			} else if response.StructType == polaris.PProbe {
++				switch flags.format {
++
++				case "human":
++					printf("Received SCMP P-Probe response:\n")
++					printf("NextHeader: %d\n", response.Pprobe.NextHeader)
++					printf("ExtLen: %d\n", response.Pprobe.ExtLen)
++					printf("RequestIdentifier: %d\n", response.Pprobe.RequestIdentifier)
++					printf("SequenceNumber: %d\n", response.Pprobe.SequenceNumber)
++					printf("CumQueuingDelay: %f\n", response.Pprobe.CumQueuingDelay.Float32())
++					printf("ASIdentifier: %s\n", response.Pprobe.ASIdentifier)
++					printf("InterfaceID: %d\n", response.Pprobe.InterfaceID)
++					printf("BottleneckShare: %f\n", response.Pprobe.BottleneckShare.Float32())
++				case "json":
++					enc := json.NewEncoder(os.Stdout)
++					enc.SetIndent("", "  ")
++					enc.SetEscapeHTML(false)
++					return enc.Encode(res)
++				case "yaml":
++					enc := yaml.NewEncoder(os.Stdout)
++					return enc.Encode(res)
++				}
++			} else {
++				// This should be a congestion alert
++				switch flags.format {
++
++				case "human":
++					printf("Received SCMP Polaris Congestion Alert response:\n")
++					printf("RequestIdentifier: %d\n", response.PCA.RequestIdentifier)
++					printf("SequenceNumber: %d\n", response.PCA.SequenceNumber)
++					printf("ASIdentifier: %s\n", response.PCA.ASIdentifier)
++					printf("InterfaceID: %d\n", response.PCA.InterfaceID)
++				case "json":
++					enc := json.NewEncoder(os.Stdout)
++					enc.SetIndent("", "  ")
++					enc.SetEscapeHTML(false)
++					return enc.Encode(res)
++				case "yaml":
++					enc := yaml.NewEncoder(os.Stdout)
++					return enc.Encode(res)
++				}
++			}
++			return nil
++		},
++	}
++
++	// text from ping command
++	envFlags.Register(cmd.Flags())
++	cmd.Flags().StringVar(&flags.logLevel, "log.level", "", app.LogLevelUsage)
++	cmd.Flags().StringVar(&flags.tracer, "tracing.agent", "", "Tracing agent address")
++	cmd.Flags().BoolVar(&flags.epic, "epic", false, "Enable EPIC for path probing.")
++	cmd.Flags().StringVar(&flags.format, "format", "human",
++		"Specify the output format (human|json|yaml)")
++	return cmd
++}
++
++// ------------------------------------------ Congestion Alert ------------------------------------------
++
++func newPCA(pather CommandPather) *cobra.Command {
++	var envFlags flag.SCIONEnvironment
++	var flags struct {
++		logLevel string
++		tracer   string
++		epic     bool
++		format   string
++	}
++
++	var cmd = &cobra.Command{
++		Use:     "pprobe [flags] <path>",
++		Short:   "Send a Polaris Congestion Alert SCMP message to a SCION address. Over a specified path.",
++		Example: "scion pca 1-ff00:0:111,10.150.0.71",
++		Long:    `Send a Polaris Congestion Alert SCMP message to a SCION address. Over a specified path.`,
++		Args:    cobra.ExactArgs(1),
++		RunE: func(cmd *cobra.Command, args []string) error {
++			// remote, err := addr.ParseAddr(args[0])
++			// if err != nil {
++			// 	return serrors.Wrap("parsing remote", err)
++			// }
++			// if err := app.SetupLog(flags.logLevel); err != nil {
++			// 	return serrors.Wrap("setting up logging", err)
++			// }
++			// closer, err := setupTracer("traceroute", flags.tracer)
++			// if err != nil {
++			// 	return serrors.Wrap("setting up tracing", err)
++			// }
++			// defer closer()
++			printf, err := getPrintf(flags.format, cmd.OutOrStdout())
++			if err != nil {
++				return serrors.Wrap("get formatting", err)
++			}
++			printf("Note yet implemented!")
++			return nil
++			// log.Debug("Arguments to the function: %v\n", args)
++			// log.Debug("Command: %v\n", cmd)
++			// log.Debug("Flags: %v\n", flags)
++			// cmd.SilenceUsage = true
++
++			// if err := envFlags.LoadExternalVars(); err != nil {
++			// 	return err
++			// }
++			// daemonAddr := envFlags.Daemon()
++			// localIP := net.IP(envFlags.Local().AsSlice())
++			// log.Debug("Resolved SCION environment flags",
++			// 	"daemon", daemonAddr,
++			// 	"local", localIP,
++			// )
++
++			// span, traceCtx := tracing.CtxWith(context.Background(), "run")
++			// log.Debug("span", "span", span)
++			// log.Debug("traceCtx", "traceCtx", traceCtx)
++			// span.SetTag("dst.isd_as", remote.IA)
++			// span.SetTag("dst.host", remote.Host.IP)
++			// defer span.Finish()
++
++			// ctx, cancelF := context.WithTimeout(traceCtx, time.Second)
++			// log.Debug("ctx", "ctx", ctx)
++			// log.Debug("cancelF", "cancelF", cancelF)
++			// defer cancelF()
++			// sd, err := daemon.NewService(daemonAddr).Connect(ctx)
++			// if err != nil {
++			// 	return serrors.Wrap("connecting to SCION Daemon", err)
++			// }
++			// defer sd.Close()
++			// log.Debug("Before loading topology")
++			// topo, err := daemon.LoadTopology(ctx, sd)
++			// log.Debug("After loading topology")
++			// if err != nil {
++			// 	return serrors.Wrap("loading topology", err)
++			// }
++			// span.SetTag("src.isd_as", topo.LocalIA)
++
++			// log.Debug("Topology of sciond", "topo", topo)
++			// // log.Debug("Remote address", "remote", remote)
++			// // log.Debug("Local address", "local", localIP)
++			// // log.Debug("topo error", "err", err)
++			// path, err := path.Choose(traceCtx, sd, remote.IA,
++			// 	path.WithEPIC(flags.epic),
++			// )
++			// if err != nil {
++			// 	return err
++			// }
++			// nextHop := path.UnderlayNextHop()
++			// if nextHop == nil {
++			// 	nextHop = &net.UDPAddr{
++			// 		IP:   remote.Host.IP().AsSlice(),
++			// 		Port: topology.EndhostPort,
++			// 		Zone: remote.Host.IP().Zone(),
++			// 	}
++			// }
++
++			// if localIP == nil {
++			// 	target := remote.Host.IP().AsSlice()
++			// 	if nextHop != nil {
++			// 		target = nextHop.IP
++			// 	}
++			// 	if localIP, err = addrutil.ResolveLocal(target); err != nil {
++			// 		return serrors.Wrap("resolving local address", err)
++			// 	}
++			// 	printf("Resolved local address:\n  %s\n", localIP)
++			// }
++			// printf("Using path:\n  %s\n\n", path)
++
++			// seq, err := pathpol.GetSequence(path)
++			// if err != nil {
++			// 	return serrors.New("get sequence from used path")
++			// }
++			// var res ResultTraceroute
++			// res.Path = Path{
++			// 	Fingerprint: snet.Fingerprint(path).String(),
++			// 	Hops:        getHops(path),
++			// 	Sequence:    seq,
++			// 	LocalIP:     localIP,
++			// 	NextHop:     path.UnderlayNextHop().String(),
++			// }
++
++			// span.SetTag("src.host", localIP)
++			// asNetipAddr, ok := netip.AddrFromSlice(localIP)
++			// if !ok {
++			// 	panic("Invalid Local IP address")
++			// }
++			// local := addr.Addr{
++			// 	IA:   topo.LocalIA,
++			// 	Host: addr.HostIP(asNetipAddr),
++			// }
++			// ctx = app.WithSignal(traceCtx, os.Interrupt, syscall.SIGTERM)
++
++			// var updates []polaris.Update
++			// log.Debug("We are before the config of Pprobe Polaris")
++			// cfg := polaris.Config{
++			// 	Topology:     topo,
++			// 	Remote:       remote,
++			// 	NextHop:      nextHop,
++			// 	MTU:          path.Metadata().MTU,
++			// 	Local:        local,
++			// 	PathEntry:    path,
++			// 	ProbesPerHop: 3,
++			// 	ErrHandler:   func(err error) { fmt.Fprintf(os.Stderr, "ERROR: %s\n", err) },
++			// 	EPIC:         flags.epic,
++			// }
++			// log.Debug("Running Pprobe", "config", cfg)
++
++			// response, err := polaris.Run(ctx, cfg)
++			// if err != nil {
++			// 	return err
++			// }
++			// res.Hops = make([]HopInfo, 0, len(updates))
++
++			// switch flags.format {
++
++			// case "human":
++			// 	printf("Received SCMP P-Probe response:\n")
++			// 	printf("NextHeader: %d\n", response.NextHeader)
++			// 	printf("ExtLen: %d\n", response.ExtLen)
++			// 	printf("RequestIdentifier: %d\n", response.RequestIdentifier)
++			// 	printf("SequenceNumber: %d\n", response.SequenceNumber)
++			// 	printf("CumQueuingDelay: %f\n", response.CumQueuingDelay.Float32())
++			// 	printf("ASIdentifier: %s\n", response.ASIdentifier)
++			// 	printf("InterfaceID: %d\n", response.InterfaceID)
++			// 	printf("BottleneckShare: %f\n", response.BottleneckShare.Float32())
++			// case "json":
++			// 	enc := json.NewEncoder(os.Stdout)
++			// 	enc.SetIndent("", "  ")
++			// 	enc.SetEscapeHTML(false)
++			// 	return enc.Encode(res)
++			// case "yaml":
++			// 	enc := yaml.NewEncoder(os.Stdout)
++			// 	return enc.Encode(res)
++			// }
++			// return nil
++		},
++	}
++	// text from ping command
++	envFlags.Register(cmd.Flags())
++	cmd.Flags().StringVar(&flags.logLevel, "log.level", "", app.LogLevelUsage)
++	cmd.Flags().StringVar(&flags.tracer, "tracing.agent", "", "Tracing agent address")
++	cmd.Flags().BoolVar(&flags.epic, "epic", false, "Enable EPIC for path probing.")
++	cmd.Flags().StringVar(&flags.format, "format", "human",
++		"Specify the output format (human|json|yaml)")
++	return cmd
++}
+diff --git a/scion/cmd/scion/traceroute.go b/scion/cmd/scion/traceroute.go
+index ca28d4924..a5493a955 100644
+--- a/scion/cmd/scion/traceroute.go
++++ b/scion/cmd/scion/traceroute.go
+@@ -98,6 +98,9 @@ On other errors, traceroute will exit with code 2.
+ 			}
+ 			defer closer()
+ 			printf, err := getPrintf(flags.format, cmd.OutOrStdout())
++			log.Debug("Arguments to the function: %v\n", args)
++			log.Debug("Command: %v\n", cmd)
++			log.Debug("Flags: %v\n", flags)
+ 			if err != nil {
+ 				return serrors.Wrap("get formatting", err)
+ 			}
+@@ -130,6 +133,7 @@ On other errors, traceroute will exit with code 2.
+ 				return serrors.Wrap("loading topology", err)
+ 			}
+ 			span.SetTag("src.isd_as", topo.LocalIA)
++			log.Debug("Topology of sciond", "topo", topo)
+ 			path, err := path.Choose(traceCtx, sd, remote.IA,
+ 				path.WithInteractive(flags.interactive),
+ 				path.WithRefresh(flags.refresh),
+@@ -203,6 +207,8 @@ On other errors, traceroute will exit with code 2.
+ 				},
+ 				EPIC: flags.epic,
+ 			}
++			log.Debug("Running traceroute", "config", cfg)
++
+ 			stats, err = traceroute.Run(ctx, cfg)
+ 			if err != nil {
+ 				return err
+diff --git a/scion/ping/ping.go b/scion/ping/ping.go
+index cf0d65f3e..9adbd55fd 100644
+--- a/scion/ping/ping.go
++++ b/scion/ping/ping.go
+@@ -125,6 +125,7 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
+ 	// Get our real local address and the port number we got.
+ 	// We use the port as identifier on the handler.
+ 	asNetipAddr, ok := netip.AddrFromSlice(conn.LocalAddr().(*net.UDPAddr).IP)
++	log.Debug("Local IP address", "addr", asNetipAddr)
+ 	if !ok {
+ 		panic("Invalid Local IP address")
+ 	}
+@@ -246,6 +247,10 @@ func (p *pinger) send(remote addr.Addr, dPath snet.DataplanePath, nextHop *net.U
+ 		SeqNumber:  uint16(sequence),
+ 		Payload:    p.pld,
+ 	})
++	log.Debug("Sending packet", "p.local", p.local, "remote", remote, "path", dPath, "SCMPEchoRequest", pkt)
++	// log.Debug("packet decoded", pkt.Decode())
++	// log.Debug("packet decoded", pkt.Payload)
++	// log.Debug("packet decoded", pkt.Payload.(snet.SCMPEchoRequest).Identifier)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -361,6 +366,7 @@ func (h scmpHandler) handle(pkt *snet.Packet) (snet.SCMPEchoReply, error) {
+ 		)
+ 	}
+ 	r := pkt.Payload.(snet.SCMPEchoReply)
++	log.Debug("SCMP echo reply", "SCMPEchoReply", r)
+ 	if r.Identifier != h.id {
+ 		return snet.SCMPEchoReply{}, serrors.New("wrong SCMP ID",
+ 			"expected", h.id, "actual", r.Identifier)
+diff --git a/scion/polaris/BUILD.bazel b/scion/polaris/BUILD.bazel
+new file mode 100644
+index 000000000..f87bd2634
+--- /dev/null
++++ b/scion/polaris/BUILD.bazel
+@@ -0,0 +1,24 @@
++load("//tools/lint:go.bzl", "go_library")
++
++go_library(
++    name = "go_default_library",
++    srcs = [
++        "PolarisCongestionAlert.go",
++        "PolarisProbe.go",
++    ],
++    importpath = "github.com/scionproto/scion/scion/polaris",
++    visibility = ["//visibility:public"],
++    deps = [
++        "//pkg/addr:go_default_library",
++        "//pkg/log:go_default_library",
++        "//pkg/private/common:go_default_library",
++        "//pkg/private/serrors:go_default_library",
++        "//pkg/snet:go_default_library",
++        "//pkg/snet/path:go_default_library",
++        "//private/topology/underlay:go_default_library",
++        "//pkg/slayers/path/scion:go_default_library",
++        "//pkg/slayers:go_default_library",
++        "@com_github_gopacket_gopacket//:go_default_library",
++        "@com_github_gopacket_gopacket//layers:go_default_library",
++    ],
++)
+diff --git a/scion/polaris/PolarisCongestionAlert.go b/scion/polaris/PolarisCongestionAlert.go
+new file mode 100644
+index 000000000..841fad09b
+--- /dev/null
++++ b/scion/polaris/PolarisCongestionAlert.go
+@@ -0,0 +1,3 @@
++// Contains the code to send a polaris congestion alert
++
++package polaris
+diff --git a/scion/polaris/PolarisProbe.go b/scion/polaris/PolarisProbe.go
+new file mode 100644
+index 000000000..feb97931d
+--- /dev/null
++++ b/scion/polaris/PolarisProbe.go
+@@ -0,0 +1,348 @@
++// contains the code to send a Polaris Probe
++
++package polaris
++
++import (
++	"context"
++	"math/rand"
++	"net"
++	"net/netip"
++	"time"
++
++	"github.com/gopacket/gopacket"
++	"github.com/scionproto/scion/pkg/addr"
++	"github.com/scionproto/scion/pkg/log"
++	"github.com/scionproto/scion/pkg/private/common"
++	"github.com/scionproto/scion/pkg/private/serrors"
++	"github.com/scionproto/scion/pkg/slayers"
++	"github.com/scionproto/scion/pkg/slayers/path/scion"
++	"github.com/scionproto/scion/pkg/snet"
++	"github.com/scionproto/scion/pkg/snet/path"
++)
++
++// Types and structures ----------------------------------------------------
++
++type returnType int
++
++const (
++	PProbe returnType = iota
++	PCA
++	Empty
++)
++
++type PProbeResult struct {
++	StructType returnType
++	Pprobe     slayers.SCMPPProbeRequest
++	PCA        slayers.SCMPPCongestionAlert
++}
++
++type HandlerReturn struct {
++	structType returnType
++	echoReply  snet.SCMPEchoReply
++	pCA        snet.SCMPPCongestionAlert
++}
++
++type scmpHandler struct {
++	replies chan<- reply
++}
++
++// Update contains the information for a single hop.
++type Update struct {
++	// Index indicates the hop index in the path.
++	Index int
++	// Remote is the remote router.
++	Remote snet.SCIONAddress
++	// Interface is the interface ID of the remote router.
++	Interface uint64
++	// RTTs are the RTTs for this hop. To detect whether there was a timeout the
++	// value of the RTT can be compared against the timeout value from the
++	// configuration.
++	RTTs []time.Duration
++}
++
++func (u Update) empty() bool {
++	return u.Index == 0 && u.Remote == (snet.SCIONAddress{}) && u.Interface == 0 && len(u.RTTs) == 0
++}
++
++// Config configures the polaris run.
++type Config struct {
++	Local   addr.Addr
++	Remote  addr.Addr
++	NextHop *net.UDPAddr
++
++	Topology    snet.Topology
++	MTU         uint16
++	PathEntry   snet.Path
++	PayloadSize uint
++	EPIC        bool
++
++	// ProbesPerHop indicates how many probes should be done per hop.
++	ProbesPerHop int
++	// ErrHandler is invoked for every error that does not cause tracerouting to
++	// abort. Execution time must be small, as it is run synchronously.
++	ErrHandler func(error)
++	// Update handler is invoked for every hop. Execution time must be
++	// small, as it is run synchronously.
++	UpdateHandler func(Update)
++}
++
++type reply struct {
++	Received time.Time
++	Reply    HandlerReturn
++	Remote   snet.SCIONAddress
++	Error    error
++}
++
++type Pprobe struct {
++	probesPerHop  int
++	timeout       time.Duration
++	conn          snet.PacketConn
++	local         addr.Addr
++	remote        addr.Addr
++	errHandler    func(error)
++	updateHandler func(Update)
++	sequence      uint16
++
++	replies <-chan reply
++
++	path    snet.Path
++	nextHop *net.UDPAddr
++	epic    bool
++	id      uint16
++	index   int
++}
++
++func Run(ctx context.Context, cfg Config) (PProbeResult, error) {
++	if _, isEmpty := cfg.PathEntry.Dataplane().(path.Empty); isEmpty {
++		return PProbeResult{StructType: Empty}, serrors.New("empty path is not allowed for traceroute")
++	}
++	replies := make(chan reply, 10)
++	sn := &snet.SCIONNetwork{
++		SCMPHandler: scmpHandler{replies: replies},
++		Topology:    cfg.Topology,
++	}
++
++	// We need to manufacture a netip.UDPAddr as we're constrained by the sn API.
++	netUdpAddr := net.UDPAddrFromAddrPort(netip.AddrPortFrom(cfg.Local.Host.IP(), 0))
++	conn, err := sn.OpenRaw(ctx, netUdpAddr)
++	if err != nil {
++		return PProbeResult{StructType: Empty}, err
++	}
++	// Get our real local address.
++	asNetipAddr, ok := netip.AddrFromSlice(conn.LocalAddr().(*net.UDPAddr).IP)
++	if !ok {
++		panic("Invalid Local IP address")
++	}
++
++	// Seed the random number generator
++	rand.New(rand.NewSource(42))
++
++	// Generate a random uint16
++	sequence := uint16(rand.Intn(1 << 16)) // 1 << 16 is 65536
++
++	local := cfg.Local
++	local.Host = addr.HostIP(asNetipAddr)
++	t := Pprobe{
++		probesPerHop:  cfg.ProbesPerHop,
++		conn:          conn,
++		local:         local,
++		remote:        cfg.Remote,
++		replies:       replies,
++		errHandler:    cfg.ErrHandler,
++		updateHandler: cfg.UpdateHandler,
++		id:            uint16(conn.LocalAddr().(*net.UDPAddr).Port),
++		path:          cfg.PathEntry,
++		sequence:      sequence,
++		timeout:       time.Second * 5,
++		nextHop:       cfg.NextHop,
++		epic:          cfg.EPIC,
++	}
++	return t.Pprobe(ctx)
++}
++
++func (t *Pprobe) Pprobe(ctx context.Context) (PProbeResult, error) {
++	scionPath, ok := t.path.Dataplane().(path.SCION)
++	// log.Debug("SCION path", "Path", scionPath)
++
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++
++	go func() {
++		defer log.HandlePanic()
++		t.drain(ctx)
++	}()
++
++	if !ok {
++		return PProbeResult{StructType: Empty}, serrors.New("only SCION path allowed for pprobe", "type", common.TypeOf(t.path.Dataplane()))
++	}
++
++	var idxPath scion.Decoded
++	if err := idxPath.DecodeFromBytes(scionPath.Raw); err != nil {
++		return PProbeResult{StructType: Empty}, serrors.Wrap("decoding path", err)
++	}
++	// log.Debug("Decoded path", "Path", idxPath)
++
++	// Set up the SCION path for the remote destination
++	scionAlertPath, err := path.NewSCIONFromDecoded(idxPath)
++	if err != nil {
++		return PProbeResult{StructType: Empty}, serrors.Wrap("setting alert flag", err)
++	}
++	// log.Debug("SCION alert path", "Path", scionAlertPath)
++
++	var alertPath snet.DataplanePath
++	if t.epic {
++		epicAlertPath, err := path.NewEPICDataplanePath(
++			scionAlertPath,
++			t.path.Metadata().EpicAuths,
++		)
++		if err != nil {
++			return PProbeResult{StructType: Empty}, err
++		}
++		alertPath = epicAlertPath
++	} else {
++		alertPath = scionAlertPath
++	}
++
++	// log.Debug("Alert path", "Path", alertPath)
++
++	// Construct the packet
++	pkt := &snet.Packet{
++		PacketInfo: snet.PacketInfo{
++			Destination: t.remote,
++			Source:      t.local,
++			Path:        alertPath,
++			Payload: snet.SCMPPProbeRequest{
++				NextHdr:           202, //slayers.L4SCMP,
++				ExtLen:            0,
++				RequestIdentifier: t.id,
++				SequenceNumber:    uint16(t.sequence),
++				CumQueuingDelay:   0,
++				ASIdentifier:      0,
++				InterfaceID:       0,
++				BottleneckShare:   65535, // max uint 16 value
++			},
++		},
++	}
++
++	log.Debug("Next Hop", "NextHop", t.nextHop, "Packet", pkt)
++	if err := t.conn.WriteTo(pkt, t.nextHop); err != nil {
++		return PProbeResult{StructType: Empty}, serrors.Wrap("writing", err)
++	}
++
++	// Wait for a reply
++
++	var scmpPp slayers.SCMPPProbeRequest
++	var scmpPCA slayers.SCMPPCongestionAlert
++	var ReturnVal PProbeResult
++
++	select {
++	case <-time.After(t.timeout):
++		log.Debug("Timeout waiting for reply")
++		return PProbeResult{StructType: Empty}, serrors.New("timeout waiting for reply")
++	case reply := <-t.replies:
++		log.Debug("Received reply", "Reply", reply.Reply, "Error", reply.Error)
++		if reply.Error != nil {
++			if t.errHandler != nil {
++				return PProbeResult{StructType: Empty}, serrors.Wrap("error in reply", reply.Error)
++			}
++		}
++		if reply.Reply.structType == Empty {
++			return PProbeResult{StructType: Empty}, serrors.Wrap("no packet received. Empty HandleReturn", err)
++		} else if reply.Reply.structType == PProbe {
++
++			log.Debug("Received reply", "t.id", t.id, "reply.Reply.Identifier", reply.Reply.echoReply.Identifier, "reply.Reply.SeqNumber", reply.Reply.echoReply.SeqNumber)
++			if t.id != reply.Reply.echoReply.Identifier {
++				if t.errHandler != nil {
++					return PProbeResult{StructType: Empty}, serrors.New("wrong SCMP ID", "expected", t.id, "actual", reply.Reply.echoReply.Identifier)
++				}
++			}
++			errPp := scmpPp.DecodeFromBytes(reply.Reply.echoReply.Payload, gopacket.NilDecodeFeedback)
++			if errPp != nil {
++				log.Debug("Parsing SCMPProbeRequest failed:", "err", errPp)
++				return PProbeResult{StructType: Empty}, serrors.Wrap("parsing SCMPProbeRequest", errPp)
++			}
++			log.Debug("SCMPProbeRequest reply:", "scmpPp", scmpPp)
++			ReturnVal = PProbeResult{
++				StructType: PProbe,
++				Pprobe:     scmpPp,
++			}
++		} else {
++			// In this case it has to be a congestion alert
++			log.Debug("Received reply", "t.id", t.id, "reply.Reply.Identifier", reply.Reply.pCA.RequestIdentifier, "reply.Reply.SeqNumber", reply.Reply.pCA.SequenceNumber)
++			if t.id != reply.Reply.pCA.RequestIdentifier {
++				if t.errHandler != nil {
++					return PProbeResult{StructType: Empty}, serrors.New("wrong SCMP ID", "expected", t.id, "actual", reply.Reply.pCA.RequestIdentifier)
++				}
++			}
++
++			scmpPCA.ASIdentifier = reply.Reply.pCA.ASIdentifier
++			scmpPCA.InterfaceID = reply.Reply.pCA.InterfaceID
++			scmpPCA.RequestIdentifier = reply.Reply.pCA.RequestIdentifier
++			scmpPCA.SequenceNumber = reply.Reply.pCA.SequenceNumber
++			ReturnVal = PProbeResult{
++				StructType: PCA,
++				PCA:        scmpPCA,
++			}
++		}
++
++	case <-ctx.Done():
++		log.Debug("SCMPProbeRequest reply:", "scmpPp", scmpPp)
++		return ReturnVal, nil
++	}
++
++	log.Debug("After select statement")
++
++	return ReturnVal, nil
++}
++
++// functions of handlers and other structures
++
++func (t Pprobe) drain(ctx context.Context) {
++	var last time.Time
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		default:
++			var pkt snet.Packet
++			var ov net.UDPAddr
++			if err := t.conn.ReadFrom(&pkt, &ov); err != nil && t.errHandler != nil {
++				// Rate limit the error reports.
++				if now := time.Now(); now.Sub(last) > 500*time.Millisecond {
++					t.errHandler(serrors.Wrap("reading packet", err))
++					last = now
++				}
++			}
++		}
++	}
++}
++
++func (h scmpHandler) Handle(pkt *snet.Packet) error {
++	log.Debug("SCMP handler", "Packet", pkt)
++	r, err := h.handle(pkt)
++
++	h.replies <- reply{
++		Received: time.Now(),
++		Reply:    r,
++		Remote:   pkt.Source,
++		Error:    err,
++	}
++	return nil
++}
++
++func (h scmpHandler) handle(pkt *snet.Packet) (HandlerReturn, error) {
++	if pkt.Payload == nil {
++
++		return HandlerReturn{structType: Empty}, serrors.New("no payload found")
++	}
++	r, okEcho := pkt.Payload.(snet.SCMPEchoReply)
++	if !okEcho {
++		r, okPCA := pkt.Payload.(snet.SCMPPCongestionAlert)
++		if !okPCA {
++			return HandlerReturn{structType: Empty}, serrors.New("not SCMP echo reply or congestion alert",
++				"type", common.TypeOf(pkt.Payload))
++		}
++		return HandlerReturn{structType: PCA, pCA: r}, nil
++	}
++	return HandlerReturn{structType: PProbe, echoReply: r}, nil
++}

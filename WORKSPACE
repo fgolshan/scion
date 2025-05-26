@@ -306,3 +306,12 @@ http_archive(
 register_toolchains(
     "//dist/openwrt:x86_64_openwrt_toolchain",
 )
+
+load("@bazel_gazelle//:deps.bzl", "go_repository")
+
+go_repository(
+    name = "com_github_x448_float16",
+    importpath = "github.com/x448/float16",
+    sum = "h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=",
+    version = "v0.8.4",
+)

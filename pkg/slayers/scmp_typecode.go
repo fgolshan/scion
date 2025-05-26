@@ -80,6 +80,9 @@ const (
 	SCMPTypeEchoReply         SCMPType = 129
 	SCMPTypeTracerouteRequest SCMPType = 130
 	SCMPTypeTracerouteReply   SCMPType = 131
+	// New SCMP types for Polaris
+	SCMPTypePolarisProbeRequest    SCMPType = 132
+	SCMPTypePolarisCongestionAlert SCMPType = 133
 )
 
 // SCMPTypeCode represents SCMP type/code case.
@@ -138,6 +141,9 @@ var scmpTypeCodeInfo = map[SCMPType]struct {
 	SCMPTypeEchoReply:                {name: "EchoReply"},
 	SCMPTypeTracerouteRequest:        {name: "TracerouteRequest"},
 	SCMPTypeTracerouteReply:          {name: "TracerouteReply"},
+	// New SCMP types for Polaris
+	SCMPTypePolarisProbeRequest:    {name: "PolarisProbeRequest"},
+	SCMPTypePolarisCongestionAlert: {name: "PolarisCongestionAlertRequest"},
 	SCMPTypeParameterProblem: {
 		"ParameterProblem", map[SCMPCode]string{
 			SCMPCodeErroneousHeaderField:      "ErroneousHeaderField",

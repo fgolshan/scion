@@ -116,7 +116,6 @@ var (
 			Decoder: gopacket.DecodeFunc(decodeSCMPTraceroute),
 		},
 	)
-
 	EndpointUDPPort = gopacket.RegisterEndpointType(
 		1005,
 		gopacket.EndpointTypeMetadata{
@@ -126,6 +125,22 @@ var (
 			},
 		},
 	)
+	// Polaris specific layer types ------------------------------------------------------
+	LayerTypeSCMPPProbeRequest = gopacket.RegisterLayerType(
+		1132,
+		gopacket.LayerTypeMetadata{
+			Name:    "SCMPPProbeRequest",
+			Decoder: gopacket.DecodeFunc(decodeSCMPPProbeRequest),
+		},
+	)
+	LayerTypeSCMPPCongestionAlert = gopacket.RegisterLayerType(
+		1133,
+		gopacket.LayerTypeMetadata{
+			Name:    "SCMPPCongestionAlert",
+			Decoder: gopacket.DecodeFunc(decodeSCMPPCongestionAlert),
+		},
+	)
+	// ----------------------------------------------------------------------------
 
 	// layerTypeBFD is the identifier for gopacket/layers.LayerTypeBFD.
 	// Defining this with a constant here allows to build slayers without linking

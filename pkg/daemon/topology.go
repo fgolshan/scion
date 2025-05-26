@@ -37,9 +37,15 @@ func LoadTopology(ctx context.Context, conn Connector) (snet.Topology, error) {
 		return snet.Topology{}, serrors.Wrap("loading port range", err)
 	}
 	interfaces, err := conn.Interfaces(ctx)
+	// log.Debug("interfaces", "interfaces", interfaces)
+	log.Debug("ctx", "ctx", ctx)
+	// log.Debug("error", "error", err)
 	if err != nil {
 		return snet.Topology{}, serrors.Wrap("loading interfaces", err)
 	}
+
+	// log.Debug("Loaded topology", "local_ia", ia, "port_range", start, end,
+	// 	"interfaces", interfaces)
 
 	return snet.Topology{
 		LocalIA: ia,

@@ -92,10 +92,10 @@ func newPing(pather CommandPather) *cobra.Command {
 
 	var cmd = &cobra.Command{
 		Use:   "ping [flags] <remote>",
-		Short: "Test connectivity to a remote SCION host using SCMP echo packets",
+		Short: "Test connectivity to a remote SCION host using SCMP echo packets. Comment to see if it works",
 		Example: fmt.Sprintf(`  %[1]s ping 1-ff00:0:110,10.0.0.1
   %[1]s ping 1-ff00:0:110,10.0.0.1 -c 5`, pather.CommandPath()),
-		Long: fmt.Sprintf(`'ping' test connectivity to a remote SCION host using SCMP echo packets.
+		Long: fmt.Sprintf(`'ping' test connectivity to a remote SCION host using SCMP echo packets. Comment to see if it works.
 
 When the \--count option is set, ping sends the specified number of SCMP echo packets
 and reports back the statistics.
@@ -139,6 +139,9 @@ On other errors, ping will exit with code 2.
 			)
 
 			span, traceCtx := tracing.CtxWith(context.Background(), "run")
+			log.Debug("Tracing enabled", "tracer", flags.tracer)
+			log.Debug("Context Background of span:", "Background", context.Background())
+
 			span.SetTag("dst.isd_as", remote.IA)
 			span.SetTag("dst.host", remote.Host.IP)
 			defer span.Finish()

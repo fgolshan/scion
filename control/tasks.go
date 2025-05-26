@@ -26,6 +26,7 @@ import (
 	"github.com/scionproto/scion/control/ifstate"
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/experimental/hiddenpath"
+	"github.com/scionproto/scion/pkg/log"
 	"github.com/scionproto/scion/pkg/metrics"
 	seg "github.com/scionproto/scion/pkg/segment"
 	"github.com/scionproto/scion/pkg/snet"
@@ -84,6 +85,7 @@ func (t *TasksConfig) Originator() *periodic.Runner {
 	if !t.Core {
 		return nil
 	}
+	log.Debug("Starting beacon originator")
 	s := &beaconing.Originator{
 		Extender: t.extender("originator", t.IA, t.MTU, func() uint8 {
 			return t.BeaconStore.MaxExpTime(beacon.PropPolicy)
@@ -272,6 +274,7 @@ func StartTasks(cfg TasksConfig) (*Tasks, error) {
 
 	segCleaner := pathdb.NewCleaner(cfg.PathDB, "control_pathstorage_segments")
 	segRevCleaner := revcache.NewCleaner(cfg.RevCache, "control_pathstorage_revocation")
+	log.Debug("Starting periodic tasks")
 	return &Tasks{
 		Originator: cfg.Originator(),
 		Propagator: cfg.Propagator(),

@@ -18,6 +18,7 @@ import (
 	"math/rand/v2"
 
 	"github.com/gopacket/gopacket"
+	"github.com/x448/float16"
 
 	"github.com/scionproto/scion/pkg/addr"
 	"github.com/scionproto/scion/pkg/private/common"
@@ -345,6 +346,106 @@ func toLayers(scmpPld SCMPPayload,
 	return l
 }
 
+// Implementation of Polaris specific types --------------------------------------------
+// Pprobe:
+//
+//	Enables the endhost to receive an estimate of the bottleneck bandwith.
+//	The routers on the paths are aware of their link capacity and can keep track of the number of flows traversing it.
+//	After the Pprobe traversed the path, the destination sends back an echo reply of the Pprobe.
+//
+// Pprobe Fields:
+// NextHdr: Specifies the type of the next header
+// ExtLen: Specifies the length of the extension header
+// Type, Code and Checksum: Are taken from SCMPPayload. The type codes are defined in scmp_typecode.go
+//
+//	SCMPTypePolarisProbeRequest    SCMPType = 132
+//	SCMPTypePolarisCongestionAlert SCMPType = 133
+//
+// RequestIdentifier: A unique identifier for the request. 16 bit size
+// SequenceNumber: A unique sequence number for the request. 16 bit size
+//
+//	They help in matching the echo return message to the probe message.
+//
+// CumQueuingDelay: The cumulative queuing delay inside the queue of each border router. 16 bit size
+// ASIdentifier: The AS identifier of the AS that the probe is sent to. 64 bit size
+// InterfaceID: The interface identifier of the interface that is the bottelneck. 16 bit size
+//
+//  These two fields can be set to zero to conceal the bottleneck location.
+//
+// BottleneckShare: The bottleneck share of the link. 16 bit size in IEEE-754 half-precision floating point format.
+
+type SCMPPProbeRequest struct {
+	NextHdr           uint8 //slayers.L4ProtocolType
+	ExtLen            uint8
+	RequestIdentifier uint16
+	SequenceNumber    uint16
+	CumQueuingDelay   float16.Float16 //float16.Float16 store in uint format and then convert while retrieving
+	ASIdentifier      addr.IA
+	InterfaceID       uint16
+	BottleneckShare   float16.Float16 //float16.Float16 store in uint format and then convert while retrieving
+	//Payload           []byte
+}
+
+func (m SCMPPProbeRequest) toLayers(scn *slayers.SCION) []gopacket.SerializableLayer {
+	return toLayers(m, scn,
+		&slayers.SCMPPProbeRequest{
+			NextHeader:        m.NextHdr,
+			ExtLen:            m.ExtLen,
+			RequestIdentifier: m.RequestIdentifier,
+			SequenceNumber:    m.SequenceNumber,
+			CumQueuingDelay:   m.CumQueuingDelay,
+			ASIdentifier:      m.ASIdentifier,
+			InterfaceID:       m.InterfaceID,
+			BottleneckShare:   m.BottleneckShare,
+		},
+		nil,
+	)
+}
+
+func (SCMPPProbeRequest) Type() slayers.SCMPType { return slayers.SCMPTypePolarisProbeRequest }
+
+func (SCMPPProbeRequest) Code() slayers.SCMPCode { return 0 }
+
+func (m SCMPPProbeRequest) length() int {
+	// 3 * 64 bits
+	return 192
+}
+
+// Does not need a reply struct. This is because an echo is used to send the probe back to the source.
+
+// P - CA:
+// RequestIdentifier and SequenceNumber are set to the same values as the Pprobe.
+// ASIdentifier and InterfaceID are set to the alert originator.
+type SCMPPCongestionAlert struct {
+	RequestIdentifier uint16
+	SequenceNumber    uint16
+	ASIdentifier      addr.IA
+	InterfaceID       uint16
+}
+
+func (m SCMPPCongestionAlert) toLayers(scn *slayers.SCION) []gopacket.SerializableLayer {
+	return toLayers(m, scn,
+		&slayers.SCMPPCongestionAlert{
+			RequestIdentifier: m.RequestIdentifier,
+			SequenceNumber:    m.SequenceNumber,
+			ASIdentifier:      m.ASIdentifier,
+			InterfaceID:       m.InterfaceID,
+		},
+		nil,
+	)
+}
+
+func (SCMPPCongestionAlert) Type() slayers.SCMPType { return slayers.SCMPTypePolarisCongestionAlert }
+
+func (SCMPPCongestionAlert) Code() slayers.SCMPCode { return 0 }
+
+func (m SCMPPCongestionAlert) length() int {
+	// 2 * 64 bits + 16 bits
+	return 144
+}
+
+// --------------------------------------------------------------------------------------------
+
 // RawPath is the unprocessed path that is read from a received SCION packet
 //
 // Packets that are received on the SCIONPacketConn contain a struct of this
@@ -535,6 +636,36 @@ func (p *Packet) Decode() error {
 				Sequence:   v.Sequence,
 				IA:         v.IA,
 				Interface:  v.Interface,
+			}
+		case slayers.SCMPTypePolarisProbeRequest:
+			v, ok := layer.(*slayers.SCMPPProbeRequest)
+			if !ok {
+				return serrors.New("invalid SCMP packet",
+					"scmp.type", scmpLayer.TypeCode,
+					"payload.type", common.TypeOf(layer))
+			}
+			p.Payload = SCMPPProbeRequest{
+				NextHdr:           v.NextHeader,
+				ExtLen:            v.ExtLen,
+				RequestIdentifier: v.RequestIdentifier,
+				SequenceNumber:    v.SequenceNumber,
+				CumQueuingDelay:   v.CumQueuingDelay,
+				ASIdentifier:      v.ASIdentifier,
+				InterfaceID:       v.InterfaceID,
+				BottleneckShare:   v.BottleneckShare,
+			}
+		case slayers.SCMPTypePolarisCongestionAlert:
+			v, ok := layer.(*slayers.SCMPPCongestionAlert)
+			if !ok {
+				return serrors.New("invalid SCMP packet",
+					"scmp.type", scmpLayer.TypeCode,
+					"payload.type", common.TypeOf(layer))
+			}
+			p.Payload = SCMPPCongestionAlert{
+				RequestIdentifier: v.RequestIdentifier,
+				SequenceNumber:    v.SequenceNumber,
+				ASIdentifier:      v.ASIdentifier,
+				InterfaceID:       v.InterfaceID,
 			}
 		default:
 			return serrors.New("unhandled SCMP type", "type", scmpLayer.TypeCode, "src", p.Source)

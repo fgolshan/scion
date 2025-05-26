@@ -37,6 +37,7 @@ func LoadTrustMaterial(ctx context.Context, configDir string, db trust.DB) error
 	if err != nil {
 		return serrors.Wrap("loading TRCs from disk", err)
 	}
+	logger.Debug("Message to confirm that it works.")
 	logger.Info("TRCs loaded", "files", loaded.Loaded)
 	for f, r := range loaded.Ignored {
 		if errors.Is(r, trust.ErrAlreadyExists) {

@@ -125,6 +125,7 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 	// Get our real local address and the port number we got.
 	// We use the port as identifier on the handler.
 	asNetipAddr, ok := netip.AddrFromSlice(conn.LocalAddr().(*net.UDPAddr).IP)
+	log.Debug("Local IP address", "addr", asNetipAddr)
 	if !ok {
 		panic("Invalid Local IP address")
 	}
@@ -246,6 +247,10 @@ func (p *pinger) send(remote addr.Addr, dPath snet.DataplanePath, nextHop *net.U
 		SeqNumber:  uint16(sequence),
 		Payload:    p.pld,
 	})
+	log.Debug("Sending packet", "p.local", p.local, "remote", remote, "path", dPath, "SCMPEchoRequest", pkt)
+	// log.Debug("packet decoded", pkt.Decode())
+	// log.Debug("packet decoded", pkt.Payload)
+	// log.Debug("packet decoded", pkt.Payload.(snet.SCMPEchoRequest).Identifier)
 	if err != nil {
 		return err
 	}
@@ -361,6 +366,7 @@ func (h scmpHandler) handle(pkt *snet.Packet) (snet.SCMPEchoReply, error) {
 		)
 	}
 	r := pkt.Payload.(snet.SCMPEchoReply)
+	log.Debug("SCMP echo reply", "SCMPEchoReply", r)
 	if r.Identifier != h.id {
 		return snet.SCMPEchoReply{}, serrors.New("wrong SCMP ID",
 			"expected", h.id, "actual", r.Identifier)

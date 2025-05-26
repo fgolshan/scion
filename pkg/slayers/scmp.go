@@ -89,6 +89,10 @@ func (s *SCMP) NextLayerType() gopacket.LayerType {
 		return LayerTypeSCMPEcho
 	case SCMPTypeTracerouteRequest, SCMPTypeTracerouteReply:
 		return LayerTypeSCMPTraceroute
+	case SCMPTypePolarisProbeRequest:
+		return LayerTypeSCMPPProbeRequest
+	case SCMPTypePolarisCongestionAlert:
+		return LayerTypeSCMPPCongestionAlert
 	}
 	return gopacket.LayerTypePayload
 }

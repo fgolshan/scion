@@ -39,6 +39,7 @@ go_library(
         "//private/topology:go_default_library",
         "//private/topology/underlay:go_default_library",
         "@com_github_gopacket_gopacket//:go_default_library",
+        "@com_github_x448_float16//:go_default_library",
     ] + select({
         "@io_bazel_rules_go//go/platform:windows": [
             "@org_golang_x_sys//windows:go_default_library",
@@ -67,5 +68,6 @@ go_test(
         "//pkg/snet/path:go_default_library",
         "@com_github_stretchr_testify//assert:go_default_library",
         "@com_github_stretchr_testify//require:go_default_library",
+        "@com_github_x448_float16//:go_default_library",
     ],
 )

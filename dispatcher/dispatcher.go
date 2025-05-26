@@ -161,6 +161,7 @@ func (s *Server) processMsgNextHop(
 	underlay netip.Addr,
 	prevHop netip.AddrPort,
 ) ([]byte, netip.AddrPort, error) {
+	log.Debug("Processing message", "buf", buf)
 
 	err := s.parser.DecodeLayers(buf, &s.decoded)
 	if err != nil {
@@ -198,10 +199,13 @@ func (s *Server) processMsgNextHop(
 	switch s.decoded[len(s.decoded)-1] {
 	case slayers.LayerTypeSCMP:
 		// send response to BR
+		log.Debug("Layertype SCMP, sending to BR")
 		if s.scmpLayer.TypeCode.Type() == slayers.SCMPTypeTracerouteRequest ||
 			s.scmpLayer.TypeCode.Type() == slayers.SCMPTypeEchoRequest {
 			dstAddrPort = prevHop
+			log.Debug("SCMPInfo packet, sending to previous hop", "prevHop", prevHop, "type", slayers.SCMPTypeEchoRequest)
 		} else { // relay to end application
+			log.Debug("SCMPInfo packet, sending to end application, no scmp echo")
 			dstAddrPort, err = s.getDstSCMP()
 			if err != nil {
 				log.Error("Getting destination for SCMP message", "err", err)
@@ -215,6 +219,7 @@ func (s *Server) processMsgNextHop(
 			}
 		}
 	case slayers.LayerTypeSCIONUDP:
+		log.Debug("Layertype SCIONUDP, sending to end application")
 		dstAddrPort, err = s.getDstSCIONUDP()
 		if err != nil {
 			log.Error("Getting destination for SCION/UDP message", "err", err)
@@ -234,6 +239,7 @@ func (s *Server) processMsgNextHop(
 		(s.scmpLayer.TypeCode.Type() == slayers.SCMPTypeTracerouteRequest ||
 			s.scmpLayer.TypeCode.Type() == slayers.SCMPTypeEchoRequest) {
 		err = s.replyToSCMPInfoRequest()
+		log.Debug("Replying to SCMPInfo request", "type", s.scmpLayer.TypeCode.Type())
 		if err != nil {
 			log.Error("Reversing SCMP information", "err", err)
 			return nil, netip.AddrPort{}, nil

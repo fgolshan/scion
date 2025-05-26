@@ -98,6 +98,9 @@ On other errors, traceroute will exit with code 2.
 			}
 			defer closer()
 			printf, err := getPrintf(flags.format, cmd.OutOrStdout())
+			log.Debug("Arguments to the function: %v\n", args)
+			log.Debug("Command: %v\n", cmd)
+			log.Debug("Flags: %v\n", flags)
 			if err != nil {
 				return serrors.Wrap("get formatting", err)
 			}
@@ -130,6 +133,7 @@ On other errors, traceroute will exit with code 2.
 				return serrors.Wrap("loading topology", err)
 			}
 			span.SetTag("src.isd_as", topo.LocalIA)
+			log.Debug("Topology of sciond", "topo", topo)
 			path, err := path.Choose(traceCtx, sd, remote.IA,
 				path.WithInteractive(flags.interactive),
 				path.WithRefresh(flags.refresh),
@@ -203,6 +207,8 @@ On other errors, traceroute will exit with code 2.
 				},
 				EPIC: flags.epic,
 			}
+			log.Debug("Running traceroute", "config", cfg)
+
 			stats, err = traceroute.Run(ctx, cfg)
 			if err != nil {
 				return err
