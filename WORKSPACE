@@ -315,3 +315,9 @@ go_repository(
     sum = "h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=",
     version = "v0.8.4",
 )
+
+go_repository(
+    name        = "com_github_patrickmn_go_cache",
+    importpath  = "github.com/patrickmn/go-cache",
+    tag         = "v2.1.0",
+)
