@@ -32,6 +32,7 @@ import (
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
+	"github.com/patrickmn/go-cache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/x448/float16"
 
@@ -219,7 +220,7 @@ type dataPlane struct {
 	// create a hash set of all the paths that are currently in use.
 
 	// added variables ----------------------------------------------------
-	ConnectionSSet     *ConcurrentSet
+	flowCaches         map[uint16]*cache.Cache
 	Bandwith           uint64
 	processorQueueSize int
 	ProcsQs            []chan *Packet
@@ -639,23 +640,8 @@ func (d *dataPlane) Run(ctx context.Context) error {
 	d.processorQueueSize = processorQueueSize
 	d.ProcsQs = procQs
 	d.slowQs = slowQs
-
-	// could also monitor the queues to send a Congestion Alter if the BR is congested
+	// optional queue monitoring to track congestion status
 	// d.monitorCongestionStatus()
-
-	// create a goroutine that resets the packet pool every second
-	go func() {
-		ticker := time.NewTicker(time.Second * 1)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				d.ConnectionSSet.resetPacketPool()
-				// log.Debug("Reset packet pool")
-			}
-		}
-	}()
 
 	for i := 0; i < d.RunConfig.NumProcessors; i++ {
 		go func(i int) {
@@ -784,7 +770,7 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 	if errPp == nil {
 		log.Debug("SCMPProbeRequest", "payload", scmpPp)
 
-		totalBandwith, activeLinks, totalQueuingDelay := p.d.calculateMetrics()
+		linkCapacity, numberOfFlows, queuingDelay := p.d.calculateMetrics(p.pkt)
 
 		if p.d.isCongested() {
 			// now we have to return a Congestion Alert
@@ -800,12 +786,12 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 		}
 
 		BottleneckShare := scmpPp.BottleneckShare
-		currentBottleneckShare_tmp := float32(totalBandwith) / float32(activeLinks+1)
+		currentBottleneckShare_tmp := linkCapacity / (numberOfFlows + 1.0)
 		currentBottleneckShare := float16.Fromfloat32(currentBottleneckShare_tmp)
-		log.Debug("Current bottleneck share", "currentBottleneckShare", currentBottleneckShare)
+		log.Debug("Computed bandwidth share", "currentBottleneckShare", currentBottleneckShare)
 		log.Debug("Bottleneck share", "BottleneckShare", BottleneckShare)
-		log.Debug("Total Bandwidth", "totalBandwith", totalBandwith)
-		log.Debug("Active Links", "activeLinks", activeLinks)
+		log.Debug("Link capacity", "linkCapacity", linkCapacity)
+		log.Debug("Number of flows on link", "numberOfFlows", numberOfFlows)
 
 		if currentBottleneckShare < BottleneckShare {
 			scmpPp.BottleneckShare = currentBottleneckShare
@@ -814,12 +800,12 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 		}
 
 		CumQueuingDelay := scmpPp.CumQueuingDelay
-		totalQueuingDelay_f16 := float16.Fromfloat32(totalQueuingDelay)
+		totalQueuingDelay_f16 := float16.Fromfloat32(queuingDelay)
 		final_QueingDelay := float16.Fromfloat32(totalQueuingDelay_f16.Float32() + CumQueuingDelay.Float32())
 		scmpPp.CumQueuingDelay = final_QueingDelay
-		log.Debug("CumQueuingDelay", "CumQueuingDelay", CumQueuingDelay)
-		log.Debug("Total Queuing Delay", "totalQueuingDelay", totalQueuingDelay)
-		log.Debug("Final Queuing Delay", "final_QueingDelay", final_QueingDelay)
+		log.Debug("Previous CumQueuingDelay", "CumQueuingDelay", CumQueuingDelay)
+		log.Debug("Queuing Delay", "queuingDelay", queuingDelay)
+		log.Debug("New CumQueueingDelay", "final_QueingDelay", final_QueingDelay)
 
 		// check if the packet is from the last AS router
 		isLast := p.scionLayer.DstIA == p.d.localIA
@@ -844,11 +830,12 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 	return nil
 }
 
-func (d *dataPlane) calculateMetrics() (totalBandwidth uint64, activeLinks uint64, totalQueuingDelay float32) {
-	totalQueuingDelay = float32(1.11) // quick palceholder not yet finished!!!!! Temporary!!!!
-	totalBandwidth = d.Bandwith
-	activeLinks = d.ConnectionSSet.Count()
-	return totalBandwidth, activeLinks, totalQueuingDelay
+func (d *dataPlane) calculateMetrics(pkt *Packet) (cap float32, flows float32, delay float32) {
+	delay = 0.0               // Functionality not yet implemented
+	cap = float32(d.Bandwith) // TODO: replace with per link capacities
+	fs := d.flowCaches[pkt.egress]
+	flows = float32(fs.ItemCount()) // concurrent flows on that link
+	return cap, flows, delay
 }
 
 func (d *dataPlane) isCongested() bool {
@@ -1152,7 +1139,11 @@ func (d *dataPlane) initializePolaris() {
 	// current bandwidth as long as no better way
 	d.Bandwith = 1000
 
-	d.ConnectionSSet = NewConcurrentSet()
+	// Initialize per-interface flow caches: 1s expiration, 500ms cleanup
+	d.flowCaches = make(map[uint16]*cache.Cache, len(d.interfaces))
+	for i := range d.interfaces {
+		d.flowCaches[i] = cache.New(1*time.Second, 500*time.Millisecond)
+	}
 
 	return
 }
@@ -1240,10 +1231,12 @@ func (d *dataPlane) runProcessor(id int, q <-chan *Packet, slowQ chan<- *Packet)
 		if err != nil {
 			log.Debug("Parsing destination address", "err", err)
 		}
+
+		// track flows per interface using go-cache
 		flowIdentifier := srcAddr.String() + " " + packetSave.scionLayer.SrcIA.String() + " " +
 			dstAddr.String() + " " + packetSave.scionLayer.DstIA.String()
-		// add the flow identifier to the set
-		d.ConnectionSSet.Add(flowIdentifier)
+		fc := d.flowCaches[p.egress]
+		fc.Set(flowIdentifier, true, cache.DefaultExpiration)
 
 		packetSave.scionLayer.SrcAddr()
 
