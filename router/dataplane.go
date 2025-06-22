@@ -25,6 +25,9 @@ import (
 	"hash"
 	"net"
 	"net/netip"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,6 +83,9 @@ const (
 	// Needed to compute required padding
 	ptrSize = unsafe.Sizeof(&struct{ int }{})
 	is32bit = 1 - (ptrSize-4)/4
+
+	// How often to poll `tc` for updated bandwidth limits in Polaris
+	defaultPollInterval = 5 * time.Second
 )
 
 type BFDSession interface {
@@ -219,19 +225,23 @@ type dataPlane struct {
 
 	// create a hash set of all the paths that are currently in use.
 
-	// added variables ----------------------------------------------------
-	flowCaches         map[uint16]*cache.Cache
-	Bandwith           uint64
+	// added variables for Polaris----------------------------------------------------
+	flowCaches         map[uint16]*cache.Cache    // holds the flow caches per SCION ifID
+	servicePSet        map[uint16]struct{}        // quickly test if an Port offers a control-plane service (exclude from flow caches)
+	servicePSetMu      sync.RWMutex               // protects servicePSet
+	ifaceStats         map[uint16]*InterfaceStats // holds dynamic bandwidth info per SCION ifID
+	statsMu            sync.RWMutex               // protects ifaceStats
 	processorQueueSize int
 	ProcsQs            []chan *Packet
 	slowQs             []chan *Packet
 }
 
-// --------------------------------- Added structures ----------------------------------
-type ConcurrentSet struct {
-	mu    sync.Mutex
-	set   map[string]struct{}
-	count atomic.Uint64
+// --------------------------------- Added structures for Polaris----------------------------------
+
+// InterfaceStats tracks the OS interface name and its last-known bandwidth (bps)
+type InterfaceStats struct {
+	IfName    string // e.g. "eth0"
+	DynamicBW uint64 // current bandwidth (bits/sec) as reported by `tc`
 }
 
 // -------------------------------------------------------------------------------------
@@ -260,6 +270,7 @@ var (
 	ingressInterfaceInvalid       = errors.New("ingress interface invalid")
 	macVerificationFailed         = errors.New("MAC verification failed")
 	badPacketSize                 = errors.New("bad packet size")
+	tcParsingFailed               = errors.New("could not fetch bandwidth from tc output")
 
 	// zeroBuffer will be used to reset the Authenticator option in the
 	// scionPacketProcessor.OptAuth
@@ -303,6 +314,8 @@ func makeDataPlane(runConfig RunConfig, authSCMP bool) dataPlane {
 		forwardingMetrics:              make(map[uint16]InterfaceMetrics),
 		ExperimentalSCMPAuthentication: authSCMP,
 		RunConfig:                      runConfig,
+		ifaceStats:                     make(map[uint16]*InterfaceStats),
+		servicePSet:                    make(map[uint16]struct{}),
 	}
 }
 
@@ -382,6 +395,31 @@ func (d *dataPlane) SetPortRange(start, end uint16) {
 	d.dispatchedPortEnd = end
 }
 
+// lookupInterfaceName finds the OS interface carrying the given IP.
+// If none match, returns the empty string.
+// This is used to record the OS interface name for Polaris bandwidth polling.
+func lookupInterfaceName(ip netip.Addr) string {
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			switch v := addr.(type) {
+			case *net.IPNet:
+				pfx, _ := netip.ParsePrefix(v.String())
+				if pfx.Addr() == ip {
+					return iface.Name
+				}
+			case *net.IPAddr:
+				ap, _ := netip.AddrFromSlice(v.IP)
+				if ap == ip {
+					return iface.Name
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // AddInternalInterface sets the interface the data-plane will use to
 // send/receive traffic in the local AS. This can only be called once; future
 // calls will return an error. This can only be called on a not yet running
@@ -403,7 +441,47 @@ func (d *dataPlane) AddInternalInterface(conn BatchConn, ip netip.Addr) error {
 		conn, d.RunConfig.BatchSize, d.forwardingMetrics[0])
 	d.internalIP = ip
 
+	// Record OS iface name for Polaris bandwidth polling
+	ifName := lookupInterfaceName(ip)
+	if ifName == "" {
+		log.Debug("no OS interface found for SCION internal interface", "addr", ip)
+	}
+
+	d.statsMu.Lock()
+	d.ifaceStats[0] = &InterfaceStats{
+		IfName:    ifName,
+		DynamicBW: 0, // will be seeded in Run()
+	}
+	d.statsMu.Unlock()
+
 	return nil
+}
+
+// parseTcRate looks for "rate <num><unit>" in `tc qdisc show` output,
+// supporting Tbit, Gbit, Mbit, Kbit.
+// It returns the rate in Kbits per second (Kbps) as uint64.
+func parseTcRate(tcOut string) (uint64, error) {
+	fields := strings.Fields(tcOut)
+	for i := 0; i < len(fields)-1; i++ {
+		if fields[i] == "rate" {
+			tok := fields[i+1]
+			switch {
+			case strings.HasSuffix(tok, "Tbit"):
+				v, _ := strconv.ParseUint(strings.TrimSuffix(tok, "Tbit"), 10, 64)
+				return v * 1_000_000_000, nil
+			case strings.HasSuffix(tok, "Gbit"):
+				v, _ := strconv.ParseUint(strings.TrimSuffix(tok, "Gbit"), 10, 64)
+				return v * 1_000_000, nil
+			case strings.HasSuffix(tok, "Mbit"):
+				v, _ := strconv.ParseUint(strings.TrimSuffix(tok, "Mbit"), 10, 64)
+				return v * 1_000, nil
+			case strings.HasSuffix(tok, "Kbit"):
+				v, _ := strconv.ParseUint(strings.TrimSuffix(tok, "Kbit"), 10, 64)
+				return v * 1, nil
+			}
+		}
+	}
+	return 1_000_000_000, tcParsingFailed // Default to 1Tbit if not found.
 }
 
 // AddExternalInterface adds the inter AS connection for the given interface ID.
@@ -431,6 +509,21 @@ func (d *dataPlane) AddExternalInterface(ifID uint16, conn BatchConn,
 	d.addForwardingMetrics(ifID, External)
 	d.interfaces[ifID] = d.underlay.NewExternalLink(
 		conn, d.RunConfig.BatchSize, bfd, dst.Addr, ifID, d.forwardingMetrics[ifID])
+
+	// Record OS iface name for Polaris bandwidth polling
+	ifName := lookupInterfaceName(src.Addr.Addr())
+	if ifName == "" {
+		log.Debug("no OS interface found for SCION external link",
+			"ifID", ifID,
+			"addr", src.Addr)
+	}
+	d.statsMu.Lock()
+	d.ifaceStats[ifID] = &InterfaceStats{
+		IfName:    ifName,
+		DynamicBW: 0, // will be seeded in Run()
+	}
+	d.statsMu.Unlock()
+
 	return nil
 }
 
@@ -522,6 +615,9 @@ func (d *dataPlane) AddSvc(svc addr.SVC, a netip.AddrPort) error {
 		d.Metrics.ServiceInstanceChanges.With(labels).Add(1)
 		d.Metrics.ServiceInstanceCount.With(labels).Add(1)
 	}
+	d.servicePSetMu.Lock()
+	d.servicePSet[a.Port()] = struct{}{}
+	d.servicePSetMu.Unlock()
 	return nil
 }
 
@@ -538,6 +634,9 @@ func (d *dataPlane) DelSvc(svc addr.SVC, a netip.AddrPort) error {
 		d.Metrics.ServiceInstanceChanges.With(labels).Add(1)
 		d.Metrics.ServiceInstanceCount.With(labels).Add(-1)
 	}
+	d.servicePSetMu.Lock()
+	delete(d.servicePSet, a.Port())
+	d.servicePSetMu.Unlock()
 	return nil
 }
 
@@ -635,7 +734,7 @@ func (d *dataPlane) Run(ctx context.Context) error {
 	d.setRunning()
 	d.underlay.Start(ctx, d.packetPool, procQs)
 
-	// Initialize the stats for Polaris
+	// Initialize the metrics for Polaris
 	d.initializePolaris()
 	d.processorQueueSize = processorQueueSize
 	d.ProcsQs = procQs
@@ -771,13 +870,19 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 		log.Debug("SCMPProbeRequest", "payload", scmpPp)
 
 		linkCapacity, numberOfFlows, queuingDelay := p.d.calculateMetrics(p.pkt)
+		log.Debug("Current Polaris metrics", "linkCapacity", linkCapacity,
+			"numberOfFlows", numberOfFlows, "p.pkt.egress", p.pkt.egress)
+		log.Debug("Flows in flowcache for egress interface", "flowCache", p.d.flowCaches[p.pkt.egress].Items())
+		p.d.servicePSetMu.RLock()
+		log.Debug("Ports that are ignored for flow cache", "servicePSet", p.d.servicePSet)
+		p.d.servicePSetMu.RUnlock()
 
 		if p.d.isCongested() {
 			// now we have to return a Congestion Alert
 			log.Debug("Congestion detected, sending Congestion Alert")
 			scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisCongestionAlert, 0)
 			scmpPCA := slayers.SCMPPCongestionAlert{
-				InterfaceID:       p.pkt.Ingress,
+				InterfaceID:       p.pkt.egress,
 				ASIdentifier:      p.d.localIA,
 				SequenceNumber:    scmpPp.SequenceNumber,
 				RequestIdentifier: scmpPp.RequestIdentifier,
@@ -795,7 +900,7 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 
 		if currentBottleneckShare < BottleneckShare {
 			scmpPp.BottleneckShare = currentBottleneckShare
-			scmpPp.InterfaceID = p.pkt.Ingress
+			scmpPp.InterfaceID = p.pkt.egress
 			scmpPp.ASIdentifier = p.d.localIA
 		}
 
@@ -831,8 +936,20 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 }
 
 func (d *dataPlane) calculateMetrics(pkt *Packet) (cap float32, flows float32, delay float32) {
-	delay = 0.0               // Functionality not yet implemented
-	cap = float32(d.Bandwith) // TODO: replace with per link capacities
+	delay = 0.0 // Functionality not yet implemented
+
+	cap = 1_000_000_000 // Default value, will be overwritten if stats are available
+	d.statsMu.RLock()
+	if stats, ok := d.ifaceStats[pkt.egress]; ok {
+		cap = float32(stats.DynamicBW)
+	} else {
+		log.Debug("no interface stats found for egress",
+			"egress", pkt.egress,
+			"stats", d.ifaceStats,
+			"interfaces", d.interfaces)
+	}
+	d.statsMu.RUnlock()
+
 	fs := d.flowCaches[pkt.egress]
 	flows = float32(fs.ItemCount()) // concurrent flows on that link
 	return cap, flows, delay
@@ -1134,49 +1251,65 @@ func (p *slowPathPacketProcessor) packPolarisCongestionAlert(scmpPCA slayers.SCM
 }
 
 func (d *dataPlane) initializePolaris() {
-	// Initialize the Polaris packet processor
-	// calcualte the bandwith of the links
-	// current bandwidth as long as no better way
-	d.Bandwith = 1000
+
+	// Initialize the per-interface bandwidth limitations and start polling
+	for ifID := range d.interfaces {
+		d.updateBandwidth(ifID)
+	}
+	go d.startBandwidthPolling()
 
 	// Initialize per-interface flow caches: 1s expiration, 500ms cleanup
 	d.flowCaches = make(map[uint16]*cache.Cache, len(d.interfaces))
 	for i := range d.interfaces {
 		d.flowCaches[i] = cache.New(1*time.Second, 500*time.Millisecond)
 	}
-
-	return
 }
 
-// creates a concurrent set that can be used to track the flows
-func NewConcurrentSet() *ConcurrentSet {
-	return &ConcurrentSet{
-		set: make(map[string]struct{}),
+// startBandwidthPolling runs every defaultPollInterval to refresh DynamicBW limitations per interface.
+func (d *dataPlane) startBandwidthPolling() {
+	ticker := time.NewTicker(defaultPollInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		for ifID := range d.interfaces {
+			d.updateBandwidth(ifID)
+		}
 	}
 }
 
-// Add a string to the set, increment counter if it was new
-func (cs *ConcurrentSet) Add(s string) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	if _, exists := cs.set[s]; !exists {
-		cs.set[s] = struct{}{}
-		cs.count.Add(1)
+// updateBandwidth runs `tc qdisc show dev <ifName>` and updates DynamicBW only on change.
+func (d *dataPlane) updateBandwidth(ifID uint16) {
+	var ifName string
+	var oldBW uint64
+	d.statsMu.RLock()
+	stats, ok := d.ifaceStats[ifID]
+	if ok {
+		oldBW = stats.DynamicBW
+		ifName = stats.IfName
 	}
-}
+	d.statsMu.RUnlock()
+	if !ok || ifName == "" {
+		return
+	}
 
-// Get the number of unique strings added
-func (cs *ConcurrentSet) Count() uint64 {
-	return cs.count.Load()
-}
+	out, err := exec.Command("tc", "qdisc", "show", "dev", ifName).CombinedOutput()
+	if err != nil {
+		log.Debug("failed to run `tc qdisc show`",
+			"iface", stats.IfName,
+			"err", err)
+		return
+	}
+	newBW, err := parseTcRate(string(out))
+	if err != nil {
+		log.Debug("could not parse bandwidth from `tc` output",
+			"iface", stats.IfName,
+			"output", string(out))
+	}
 
-// reset the counter and the HashSet
-func (cs *ConcurrentSet) resetPacketPool() {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	cs.count.Store(0)
-	cs.set = make(map[string]struct{})
+	if newBW != oldBW {
+		d.statsMu.Lock()
+		stats.DynamicBW = newBW
+		d.statsMu.Unlock()
+	}
 }
 
 func (d *dataPlane) monitorCongestionStatus() {
@@ -1196,6 +1329,67 @@ func (d *dataPlane) monitorCongestionStatus() {
 			}
 		}
 	}()
+}
+
+// trackFlow tracks TCP and UDP flows in the flow cache to compute bandwidth shares for Polaris.
+func (d *dataPlane) trackFlow(packetSave scionPacketProcessor, pkt *Packet) {
+
+	srcAddr, err := packetSave.scionLayer.SrcAddr()
+	if err != nil {
+		log.Debug("Failed to parse source address when tracking flow", "err", err)
+		return
+	}
+	dstAddr, err := packetSave.scionLayer.DstAddr()
+	if err != nil {
+		log.Debug("Failed to parse destination address when tracking flow", "err", err)
+		return
+	}
+	l4Type := nextHdr(packetSave.lastLayer)
+	payload := packetSave.lastLayer.LayerPayload()
+	var srcPort, dstPort uint16
+	if l4Type == slayers.L4UDP || l4Type == slayers.L4TCP {
+		if len(payload) >= 4 {
+			srcPort = binary.BigEndian.Uint16(payload[0:2])
+			dstPort = binary.BigEndian.Uint16(payload[2:4])
+		}
+	}
+
+	// Only track valid UDP and TCP flows to compute representative bandwidth shares.
+	if srcPort == 0 || dstPort == 0 {
+		return
+	}
+
+	// We do not track service traffic flows in Polaris (PCBs, revs, path‐management, cert‐fetch, etc.)
+	// These flows are not relevant for bandwidth share calculations.
+	if srcAddr.Type() == addr.HostTypeSVC || dstAddr.Type() == addr.HostTypeSVC {
+		return
+	}
+
+	// There is still remaining control traffic, how to filter it out properly?
+	// This hack does not generalize, we must filter AddressPorts or find a different approach.
+	// srcAP := netip.AddrPortFrom(srcAddr.IP(), srcPort)
+	// dstAP := netip.AddrPortFrom(dstAddr.IP(), dstPort)
+	d.servicePSetMu.RLock()
+	_, srcIsSvc := d.servicePSet[srcPort]
+	_, dstIsSvc := d.servicePSet[dstPort]
+	d.servicePSetMu.RUnlock()
+	if srcIsSvc || dstIsSvc {
+		return
+	}
+
+	// Create a unique identifier for the flow based on source and destination addresses, ports, and L4 type
+	flowIdentifier := fmt.Sprintf("%s %s %s %s %d %d %d",
+		srcAddr.String(),
+		packetSave.scionLayer.SrcIA.String(),
+		dstAddr.String(),
+		packetSave.scionLayer.DstIA.String(),
+		srcPort,
+		dstPort,
+		l4Type,
+	)
+	// Store the flow in the cache with a 1s expiration
+	fc := d.flowCaches[pkt.egress]
+	fc.Set(flowIdentifier, true, cache.DefaultExpiration)
 }
 
 // --------------------------------------------------------------------------------
@@ -1223,22 +1417,8 @@ func (d *dataPlane) runProcessor(id int, q <-chan *Packet, slowQ chan<- *Packet)
 			log.Debug("Error occured while processing packet.", "err", erro)
 		}
 
-		srcAddr, err := packetSave.scionLayer.SrcAddr()
-		if err != nil {
-			log.Debug("Parsing source address", "err", err)
-		}
-		dstAddr, err := packetSave.scionLayer.DstAddr()
-		if err != nil {
-			log.Debug("Parsing destination address", "err", err)
-		}
-
-		// track flows per interface using go-cache
-		flowIdentifier := srcAddr.String() + " " + packetSave.scionLayer.SrcIA.String() + " " +
-			dstAddr.String() + " " + packetSave.scionLayer.DstIA.String()
-		fc := d.flowCaches[p.egress]
-		fc.Set(flowIdentifier, true, cache.DefaultExpiration)
-
-		packetSave.scionLayer.SrcAddr()
+		// track the flow of the packet for Polaris
+		d.trackFlow(packetSave, p)
 
 		sc := ClassOfSize(len(p.RawPacket))
 		metrics := d.forwardingMetrics[p.Ingress][sc]
