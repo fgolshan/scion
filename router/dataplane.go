@@ -1270,6 +1270,10 @@ func (d *dataPlane) startBandwidthPolling() {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
 	for range ticker.C {
+		if !d.isRunning() {
+			log.Debug("Data plane is not running, stopping bandwidth polling")
+			return
+		}
 		for ifID := range d.interfaces {
 			d.updateBandwidth(ifID)
 		}
