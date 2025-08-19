@@ -943,6 +943,8 @@ func (d *dataPlane) calculateMetrics(pkt *Packet) (cap float32, flows float32, d
 	if stats, ok := d.ifaceStats[pkt.egress]; ok {
 		cap = float32(stats.DynamicBW)
 	} else {
+		// TODO: currently this can happen for any non-local interface, should use physical interface stats corresponding to SCION interface 0
+		// but since internal network links are not restricted, it currently does not matter.
 		log.Debug("no interface stats found for egress",
 			"egress", pkt.egress,
 			"stats", d.ifaceStats,
