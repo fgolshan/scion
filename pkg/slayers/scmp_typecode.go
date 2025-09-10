@@ -83,6 +83,11 @@ const (
 	// New SCMP types for Polaris
 	SCMPTypePolarisProbeRequest    SCMPType = 132
 	SCMPTypePolarisCongestionAlert SCMPType = 133
+	// New SCMP codes for Polaris-based traffic engineering
+	SCMPCodePolarisProbeRequest                SCMPCode = 0
+	SCMPCodePolarisProbeRequestDataPath        SCMPCode = 1
+	SCMPCodePolarisCongestionAlert             SCMPCode = 0
+	SCMPCodePolarisCongestionAlertSwitchToIfID SCMPCode = 1
 )
 
 // SCMPTypeCode represents SCMP type/code case.
@@ -142,8 +147,14 @@ var scmpTypeCodeInfo = map[SCMPType]struct {
 	SCMPTypeTracerouteRequest:        {name: "TracerouteRequest"},
 	SCMPTypeTracerouteReply:          {name: "TracerouteReply"},
 	// New SCMP types for Polaris
-	SCMPTypePolarisProbeRequest:    {name: "PolarisProbeRequest"},
-	SCMPTypePolarisCongestionAlert: {name: "PolarisCongestionAlertRequest"},
+	SCMPTypePolarisProbeRequest: {name: "PolarisProbeRequest", codes: map[SCMPCode]string{
+		SCMPCodePolarisProbeRequest:         "PolarisProbeRequest",
+		SCMPCodePolarisProbeRequestDataPath: "PolarisProbeRequestDataPath",
+	}},
+	SCMPTypePolarisCongestionAlert: {name: "PolarisCongestionAlertRequest", codes: map[SCMPCode]string{
+		SCMPCodePolarisCongestionAlert:             "PolarisCongestionAlert",
+		SCMPCodePolarisCongestionAlertSwitchToIfID: "PolarisCongestionAlertSwitchToIfID",
+	}},
 	SCMPTypeParameterProblem: {
 		"ParameterProblem", map[SCMPCode]string{
 			SCMPCodeErroneousHeaderField:      "ErroneousHeaderField",

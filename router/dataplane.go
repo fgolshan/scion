@@ -815,7 +815,7 @@ func (d *dataPlane) returnPacketToPool(pkt *Packet) {
 // -------------------------------------------------------------------------------------
 
 func PolarisPacket(lastlayer gopacket.DecodingLayer) bool {
-	// This function checks, wether a packet is a Polaris packed and therefor needs to be processed differently
+	// This function checks, wether a packet is a Polaris packet and therefore needs to be processed differently
 	scmpPayload := lastlayer.LayerPayload()
 	var scmpHeader slayers.SCMP
 	err := scmpHeader.DecodeFromBytes(scmpPayload, gopacket.NilDecodeFeedback)
@@ -824,23 +824,29 @@ func PolarisPacket(lastlayer gopacket.DecodingLayer) bool {
 		return false
 	}
 
-	if scmpHeader.TypeCode != slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisProbeRequest, 0) {
-		log.Debug("Packet with router alert, but not polaris probe request", "type_code", scmpHeader.TypeCode)
+	if scmpHeader.TypeCode.Type() != slayers.SCMPTypePolarisProbeRequest {
 		return false
 	}
 
-	// var scmpPp slayers.SCMPPProbeRequest
-	// if err := scmpPp.DecodeFromBytes(scmpHeader.Payload, gopacket.NilDecodeFeedback); err != nil {
-	// 	// log.Debug("Parsing SCMPProbeRequest", "err", err)
-	// 	// also check for Congestion alert
-	// 	// var scmPPCA slayers.SCMPPCongestionAlert
-	// 	// if err := scmPPCA.DecodeFromBytes(scmpHeader.Payload, gopacket.NilDecodeFeedback); err != nil {
-	// 	// 	log.Debug("Parsing SCMPPCongestionAlert", "err", err)
-	// 	// 	return false
-	// 	// }
-	// 	return false
-	// }
 	return true
+}
+
+func isPolarisPacketTypeCode(lastlayer gopacket.DecodingLayer) (bool, slayers.SCMPType, slayers.SCMPCode) {
+	// This function checks, wether a packet is a Polaris packet and therefore needs to be processed differently
+	// It also returns the type and code of the SCMP header for valid Polaris packets
+	scmpPayload := lastlayer.LayerPayload()
+	var scmpHeader slayers.SCMP
+	err := scmpHeader.DecodeFromBytes(scmpPayload, gopacket.NilDecodeFeedback)
+	if err != nil {
+		log.Debug("Parsing SCMP header", "err", err)
+		return false, 0, 0
+	}
+
+	if scmpHeader.TypeCode.Type() != slayers.SCMPTypePolarisProbeRequest {
+		return false, 0, 0
+	}
+
+	return true, scmpHeader.TypeCode.Type(), scmpHeader.TypeCode.Code()
 }
 
 func (p *slowPathPacketProcessor) processPolarisPacket() error {
@@ -853,7 +859,7 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 		return err
 	}
 
-	if scmpHeader.TypeCode != slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisProbeRequest, 0) {
+	if scmpHeader.TypeCode.Type() != slayers.SCMPTypePolarisProbeRequest {
 		log.Debug("Packet with router alert, but not polaris probe request", "type_code", scmpHeader.TypeCode)
 		return err
 	}
@@ -880,7 +886,7 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 		if p.d.isCongested() {
 			// now we have to return a Congestion Alert
 			log.Debug("Congestion detected, sending Congestion Alert")
-			scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisCongestionAlert, 0)
+			scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisCongestionAlert, slayers.SCMPCodePolarisCongestionAlert)
 			scmpPCA := slayers.SCMPPCongestionAlert{
 				InterfaceID:       p.pkt.egress,
 				ASIdentifier:      p.d.localIA,
@@ -1154,7 +1160,7 @@ func (p *slowPathPacketProcessor) packPolarisPacket(scmpPp slayers.SCMPPProbeReq
 }
 
 func (p *slowPathPacketProcessor) packPolarisCongestionAlert(scmpPCA slayers.SCMPPCongestionAlert, scmpHeader slayers.SCMP) error {
-	scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisCongestionAlert, 0)
+	scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisCongestionAlert, slayers.SCMPCodePolarisCongestionAlert)
 	typ := slayers.SCMPTypePolarisCongestionAlert
 	code := scmpHeader.TypeCode.Code()
 
@@ -1584,10 +1590,11 @@ func (p *slowPathPacketProcessor) processPacket(pkt *Packet) error {
 	s := pkt.slowPathRequest
 	// log.Debug("Processing slow-path packet", "slowPathRequest", s)
 	// log.Debug("Processing slow-path packet", "s.typ", s.typ)
-	if PolarisPacket(p.lastLayer) {
+	// Not sure what this is for and why it is here, but since it's been working I'll just roll with it.
+	if isPP, scmpType, scmpCode := isPolarisPacketTypeCode(p.lastLayer); isPP {
 		s.typ = slowPathSCMP
-		s.scmpType = slayers.SCMPTypePolarisProbeRequest
-		s.code = 0 //might have to change it depending on what we want to do with the packet
+		s.scmpType = scmpType
+		s.code = scmpCode
 		log.Debug("Processing slow-path packet", "SCMP type", s.scmpType)
 		log.Debug("Processing slow-path packet", "SCMP code", s.code)
 		// log.Debug("Processing packet that goes to: ", "dst", pkt.DstAddr, "src", pkt.SrcAddr)

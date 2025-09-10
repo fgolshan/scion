@@ -375,6 +375,7 @@ func toLayers(scmpPld SCMPPayload,
 // BottleneckShare: The bottleneck share of the link. 16 bit size in IEEE-754 half-precision floating point format.
 
 type SCMPPProbeRequest struct {
+	code              slayers.SCMPCode
 	NextHdr           uint8 //slayers.L4ProtocolType
 	ExtLen            uint8
 	RequestIdentifier uint16
@@ -404,7 +405,7 @@ func (m SCMPPProbeRequest) toLayers(scn *slayers.SCION) []gopacket.SerializableL
 
 func (SCMPPProbeRequest) Type() slayers.SCMPType { return slayers.SCMPTypePolarisProbeRequest }
 
-func (SCMPPProbeRequest) Code() slayers.SCMPCode { return 0 }
+func (m SCMPPProbeRequest) Code() slayers.SCMPCode { return m.code }
 
 func (m SCMPPProbeRequest) length() int {
 	// 3 * 64 bits
@@ -417,6 +418,7 @@ func (m SCMPPProbeRequest) length() int {
 // RequestIdentifier and SequenceNumber are set to the same values as the Pprobe.
 // ASIdentifier and InterfaceID are set to the alert originator.
 type SCMPPCongestionAlert struct {
+	code              slayers.SCMPCode
 	RequestIdentifier uint16
 	SequenceNumber    uint16
 	ASIdentifier      addr.IA
@@ -437,7 +439,7 @@ func (m SCMPPCongestionAlert) toLayers(scn *slayers.SCION) []gopacket.Serializab
 
 func (SCMPPCongestionAlert) Type() slayers.SCMPType { return slayers.SCMPTypePolarisCongestionAlert }
 
-func (SCMPPCongestionAlert) Code() slayers.SCMPCode { return 0 }
+func (m SCMPPCongestionAlert) Code() slayers.SCMPCode { return m.code }
 
 func (m SCMPPCongestionAlert) length() int {
 	// 2 * 64 bits + 16 bits
@@ -645,6 +647,7 @@ func (p *Packet) Decode() error {
 					"payload.type", common.TypeOf(layer))
 			}
 			p.Payload = SCMPPProbeRequest{
+				code:              scmpLayer.TypeCode.Code(),
 				NextHdr:           v.NextHeader,
 				ExtLen:            v.ExtLen,
 				RequestIdentifier: v.RequestIdentifier,
@@ -662,6 +665,7 @@ func (p *Packet) Decode() error {
 					"payload.type", common.TypeOf(layer))
 			}
 			p.Payload = SCMPPCongestionAlert{
+				code:              scmpLayer.TypeCode.Code(),
 				RequestIdentifier: v.RequestIdentifier,
 				SequenceNumber:    v.SequenceNumber,
 				ASIdentifier:      v.ASIdentifier,
