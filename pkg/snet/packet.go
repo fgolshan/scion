@@ -407,6 +407,8 @@ func (SCMPPProbeRequest) Type() slayers.SCMPType { return slayers.SCMPTypePolari
 
 func (m SCMPPProbeRequest) Code() slayers.SCMPCode { return m.code }
 
+func (m *SCMPPProbeRequest) SetCode(code slayers.SCMPCode) { m.code = code }
+
 func (m SCMPPProbeRequest) length() int {
 	// 3 * 64 bits
 	return 192

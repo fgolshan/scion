@@ -77,6 +77,7 @@ func realMain(ctx context.Context) error {
 	if err := statusPages.Register(http.DefaultServeMux, globalCfg.General.ID); err != nil {
 		return err
 	}
+	dp.DataPlane.RegisterPolarisTEHandlers(http.DefaultServeMux)
 
 	var cleanup app.Cleanup
 	g.Go(func() error {

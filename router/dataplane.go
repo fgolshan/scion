@@ -20,10 +20,14 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
+	"io"
+	"math"
 	"net"
+	"net/http"
 	"net/netip"
 	"os/exec"
 	"strconv"
@@ -223,26 +227,24 @@ type dataPlane struct {
 	// reference.
 	packetPool chan *Packet
 
-	// create a hash set of all the paths that are currently in use.
-
 	// added variables for Polaris----------------------------------------------------
-	flowCaches         map[uint16]*cache.Cache    // holds the flow caches per SCION ifID
-	servicePSet        map[uint16]struct{}        // quickly test if an Port offers a control-plane service (exclude from flow caches)
-	servicePSetMu      sync.RWMutex               // protects servicePSet
-	ifaceStats         map[uint16]*InterfaceStats // holds dynamic bandwidth info per SCION ifID
-	statsMu            sync.RWMutex               // protects ifaceStats
+	flowCachesIfID     map[uint16]*cache.Cache // holds the flow caches per SCION ifID
+	flowCachesIfName   map[string]*cache.Cache // holds the flow caches per SCION interface name
+	servicePSet        map[uint16]struct{}     // quickly test if an Port offers a control-plane service (exclude from flow caches)
+	servicePSetMu      sync.RWMutex            // protects servicePSet
+	OSIfaces           map[uint16]string       // maps SCION ifID to underlying OS interface name, e.g. "eth0"
+	ifaceDynamicBW     map[string]uint64       // holds the last fetched dynamic bandwidth (bits/sec) per OS interface name
+	ifaceMu            sync.RWMutex            // protects ifaceDynamicBW, OSIfaces is read-only after being populated by the config
 	processorQueueSize int
 	ProcsQs            []chan *Packet
 	slowQs             []chan *Packet
+
+	// --- Polaris TE rules store ---
+	teRules map[string]*polarisRule
+	teMu    sync.RWMutex
 }
 
 // --------------------------------- Added structures for Polaris----------------------------------
-
-// InterfaceStats tracks the OS interface name and its last-known bandwidth (bps)
-type InterfaceStats struct {
-	IfName    string // e.g. "eth0"
-	DynamicBW uint64 // current bandwidth (bits/sec) as reported by `tc`
-}
 
 // -------------------------------------------------------------------------------------
 
@@ -314,7 +316,8 @@ func makeDataPlane(runConfig RunConfig, authSCMP bool) dataPlane {
 		forwardingMetrics:              make(map[uint16]InterfaceMetrics),
 		ExperimentalSCMPAuthentication: authSCMP,
 		RunConfig:                      runConfig,
-		ifaceStats:                     make(map[uint16]*InterfaceStats),
+		OSIfaces:                       make(map[uint16]string),
+		ifaceDynamicBW:                 make(map[string]uint64),
 		servicePSet:                    make(map[uint16]struct{}),
 	}
 }
@@ -447,12 +450,10 @@ func (d *dataPlane) AddInternalInterface(conn BatchConn, ip netip.Addr) error {
 		log.Debug("no OS interface found for SCION internal interface", "addr", ip)
 	}
 
-	d.statsMu.Lock()
-	d.ifaceStats[0] = &InterfaceStats{
-		IfName:    ifName,
-		DynamicBW: 0, // will be seeded in Run()
-	}
-	d.statsMu.Unlock()
+	d.ifaceMu.Lock()
+	d.OSIfaces[0] = ifName
+	d.ifaceDynamicBW[ifName] = 0 // will be seeded in Run()
+	d.ifaceMu.Unlock()
 
 	return nil
 }
@@ -517,12 +518,10 @@ func (d *dataPlane) AddExternalInterface(ifID uint16, conn BatchConn,
 			"ifID", ifID,
 			"addr", src.Addr)
 	}
-	d.statsMu.Lock()
-	d.ifaceStats[ifID] = &InterfaceStats{
-		IfName:    ifName,
-		DynamicBW: 0, // will be seeded in Run()
-	}
-	d.statsMu.Unlock()
+	d.ifaceMu.Lock()
+	d.OSIfaces[ifID] = ifName
+	d.ifaceDynamicBW[ifName] = 0 // will be seeded in Run()
+	d.ifaceMu.Unlock()
 
 	return nil
 }
@@ -665,6 +664,19 @@ func (d *dataPlane) AddNextHop(ifID uint16, src, dst netip.AddrPort, cfg control
 	d.addForwardingMetrics(ifID, Sibling)
 	d.interfaces[ifID] = d.underlay.NewSiblingLink(
 		d.RunConfig.BatchSize, bfd, dst, d.forwardingMetrics[ifID])
+
+	// Record OS iface name for Polaris bandwidth polling
+	ifName := lookupInterfaceName(src.Addr())
+	if ifName == "" {
+		log.Debug("no OS interface found for SCION sibling link",
+			"ifID", ifID,
+			"addr", src.Addr())
+	}
+	d.ifaceMu.Lock()
+	d.OSIfaces[ifID] = ifName
+	d.ifaceDynamicBW[ifName] = 0 // will be seeded in Run()
+	d.ifaceMu.Unlock()
+
 	return nil
 }
 
@@ -878,14 +890,16 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 		linkCapacity, numberOfFlows, queuingDelay := p.d.calculateMetrics(p.pkt)
 		log.Debug("Current Polaris metrics", "linkCapacity", linkCapacity,
 			"numberOfFlows", numberOfFlows, "p.pkt.egress", p.pkt.egress)
-		log.Debug("Flows in flowcache for egress interface", "flowCache", p.d.flowCaches[p.pkt.egress].Items())
+		log.Debug("Flows in flowcache for egress interface", "flowCacheIfID", p.d.flowCachesIfID[p.pkt.egress].Items())
+		if ifName, ok := p.d.OSIfaces[p.pkt.egress]; ok {
+			log.Debug("Flows in flowcache of underlying interface", "ifName", ifName, "flowCacheIfName", p.d.flowCachesIfName[ifName].Items())
+		}
 		p.d.servicePSetMu.RLock()
 		log.Debug("Ports that are ignored for flow cache", "servicePSet", p.d.servicePSet)
 		p.d.servicePSetMu.RUnlock()
 
 		if p.d.isCongested() {
 			// now we have to return a Congestion Alert
-			log.Debug("Congestion detected, sending Congestion Alert")
 			scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisCongestionAlert, slayers.SCMPCodePolarisCongestionAlert)
 			scmpPCA := slayers.SCMPPCongestionAlert{
 				InterfaceID:       p.pkt.egress,
@@ -893,8 +907,52 @@ func (p *slowPathPacketProcessor) processPolarisPacket() error {
 				SequenceNumber:    scmpPp.SequenceNumber,
 				RequestIdentifier: scmpPp.RequestIdentifier,
 			}
+			srcAddr, _ := p.scionLayer.SrcAddr()
+			log.Debug("Congestion detected: emitting P-CA",
+				"pkt_egressIfID", scmpPCA.InterfaceID,
+				"sequence_number", scmpPCA.SequenceNumber,
+				"request_identifier", scmpPCA.RequestIdentifier,
+				"pprobe_srcIA", p.scionLayer.SrcIA,
+				"pprobe_srcAddr", srcAddr,
+			)
 			return p.packPolarisCongestionAlert(scmpPCA, scmpHeader)
 		}
+
+		// --- Polaris TE rules: check for policy-driven P-CA before congestion logic ---
+		probeCode := scmpHeader.TypeCode.Code()
+		now := time.Now()
+		ingressIf := p.pkt.Ingress
+		egressIf := p.pkt.egress
+
+		if rid, rule := p.d.findMatchingRule(ingressIf, egressIf, probeCode, now); rule != nil && rule.EmitPCA {
+			if p.d.consumeRuleToken(rid) {
+				// Build P-CA with rule.PCACode and optional SwitchToIfID
+				scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisCongestionAlert, rule.PCACode)
+				scmpPCA := slayers.SCMPPCongestionAlert{
+					InterfaceID:       egressIf, // default
+					ASIdentifier:      p.d.localIA,
+					SequenceNumber:    scmpPp.SequenceNumber,
+					RequestIdentifier: scmpPp.RequestIdentifier,
+				}
+				if rule.SwitchToIfID != nil {
+					scmpPCA.InterfaceID = *rule.SwitchToIfID
+				}
+				srcAddr, _ := p.scionLayer.SrcAddr()
+				log.Debug("Polaris TE rule fired: emitting P-CA",
+					"rule_id", rid,
+					"code", rule.PCACode,
+					"switch_to_ifid", scmpPCA.InterfaceID,
+					"sequence_number", scmpPCA.SequenceNumber,
+					"request_identifier", scmpPCA.RequestIdentifier,
+					"pprobe_srcIA", p.scionLayer.SrcIA,
+					"pprobe_srcAddr", srcAddr,
+				)
+				return p.packPolarisCongestionAlert(scmpPCA, scmpHeader)
+			} else {
+				log.Debug("Polaris TE rule present but out of budget", "rule_id", rid)
+			}
+		}
+		// --- end TE rule check ---
 
 		BottleneckShare := scmpPp.BottleneckShare
 		currentBottleneckShare_tmp := linkCapacity / (numberOfFlows + 1.0)
@@ -945,21 +1003,29 @@ func (d *dataPlane) calculateMetrics(pkt *Packet) (cap float32, flows float32, d
 	delay = 0.0 // Functionality not yet implemented
 
 	cap = 1_000_000_000 // Default value, will be overwritten if stats are available
-	d.statsMu.RLock()
-	if stats, ok := d.ifaceStats[pkt.egress]; ok {
-		cap = float32(stats.DynamicBW)
+	var ifname string
+	d.ifaceMu.RLock()
+	if ifn, ok := d.OSIfaces[pkt.egress]; ok {
+		if dbw, ok := d.ifaceDynamicBW[ifn]; ok {
+			cap = float32(dbw)
+			ifname = ifn
+		} else {
+			log.Debug("no dynamic bandwidth found for ifname (should never happen)",
+				"ifName", ifn,
+				"ifaceDynamicBW", d.ifaceDynamicBW)
+		}
 	} else {
-		// TODO: currently this can happen for any non-router-local interface, should use physical interface stats corresponding to SCION interface 0
-		// but since internal network links are not restricted, it currently does not matter.
 		log.Debug("no interface stats found for egress",
 			"egress", pkt.egress,
-			"stats", d.ifaceStats,
+			"OSIfaces", d.OSIfaces,
 			"interfaces", d.interfaces)
 	}
-	d.statsMu.RUnlock()
+	d.ifaceMu.RUnlock()
 
-	fs := d.flowCaches[pkt.egress]
-	flows = float32(fs.ItemCount()) // concurrent flows on that link
+	flows = 0.0
+	if fc, ok := d.flowCachesIfName[ifname]; ok {
+		flows = float32(fc.ItemCount()) // concurrent flows on that link
+	}
 	return cap, flows, delay
 }
 
@@ -1160,7 +1226,6 @@ func (p *slowPathPacketProcessor) packPolarisPacket(scmpPp slayers.SCMPPProbeReq
 }
 
 func (p *slowPathPacketProcessor) packPolarisCongestionAlert(scmpPCA slayers.SCMPPCongestionAlert, scmpHeader slayers.SCMP) error {
-	scmpHeader.TypeCode = slayers.CreateSCMPTypeCode(slayers.SCMPTypePolarisCongestionAlert, slayers.SCMPCodePolarisCongestionAlert)
 	typ := slayers.SCMPTypePolarisCongestionAlert
 	code := scmpHeader.TypeCode.Code()
 
@@ -1255,22 +1320,45 @@ func (p *slowPathPacketProcessor) packPolarisCongestionAlert(scmpPCA slayers.SCM
 	p.pkt.trafficType = ttOther
 	p.pkt.egress = p.pkt.Ingress
 	updateNetAddrFromNetAddr(p.pkt.DstAddr, p.pkt.SrcAddr)
+
+	srcAddr, _ := scionL.SrcAddr()
+	dstAddr, _ := scionL.DstAddr()
+	log.Debug("SCION packet info: Emitting P-CA",
+		"path", scionL.Path,
+		"dstIA", scionL.DstIA,
+		"dstAddr", dstAddr,
+		"srcIA", scionL.SrcIA,
+		"srcAddr", srcAddr,
+		"egressIfID", scmpPCA.InterfaceID,
+		"sequence_number", scmpPCA.SequenceNumber,
+		"request_identifier", scmpPCA.RequestIdentifier,
+		"code", scmpH.TypeCode.Code(),
+	)
+
 	return nil
 }
 
 func (d *dataPlane) initializePolaris() {
 
 	// Initialize the per-interface bandwidth limitations and start polling
-	for ifID := range d.interfaces {
-		d.updateBandwidth(ifID)
+	for ifName := range d.ifaceDynamicBW {
+		d.updateBandwidth(ifName)
 	}
 	go d.startBandwidthPolling()
 
 	// Initialize per-interface flow caches: 1s expiration, 500ms cleanup
-	d.flowCaches = make(map[uint16]*cache.Cache, len(d.interfaces))
+	d.flowCachesIfID = make(map[uint16]*cache.Cache, len(d.interfaces))
 	for i := range d.interfaces {
-		d.flowCaches[i] = cache.New(1*time.Second, 500*time.Millisecond)
+		d.flowCachesIfID[i] = cache.New(1*time.Second, 500*time.Millisecond)
 	}
+	d.flowCachesIfName = make(map[string]*cache.Cache, len(d.interfaces))
+	d.ifaceMu.RLock()
+	for ifname := range d.ifaceDynamicBW {
+		d.flowCachesIfName[ifname] = cache.New(1*time.Second, 500*time.Millisecond)
+	}
+	d.ifaceMu.RUnlock()
+
+	d.initPolarisTE()
 }
 
 // startBandwidthPolling runs every defaultPollInterval to refresh DynamicBW limitations per interface.
@@ -1282,24 +1370,22 @@ func (d *dataPlane) startBandwidthPolling() {
 			log.Debug("Data plane is not running, stopping bandwidth polling")
 			return
 		}
-		for ifID := range d.interfaces {
-			d.updateBandwidth(ifID)
+		for ifName := range d.ifaceDynamicBW {
+			d.updateBandwidth(ifName)
 		}
 	}
 }
 
 // updateBandwidth runs `tc qdisc show dev <ifName>` and updates DynamicBW only on change.
-// Not great, there is redundant work here, should use different data structure and only execute once per ifname.
-func (d *dataPlane) updateBandwidth(ifID uint16) {
-	var ifName string
+// TODO: Not great, should use library instead of calling out to `tc`, but works for time being.
+func (d *dataPlane) updateBandwidth(ifName string) {
 	var oldBW uint64
-	d.statsMu.RLock()
-	stats, ok := d.ifaceStats[ifID]
+	d.ifaceMu.RLock()
+	bw, ok := d.ifaceDynamicBW[ifName]
 	if ok {
-		oldBW = stats.DynamicBW
-		ifName = stats.IfName
+		oldBW = bw
 	}
-	d.statsMu.RUnlock()
+	d.ifaceMu.RUnlock()
 	if !ok || ifName == "" {
 		return
 	}
@@ -1307,21 +1393,21 @@ func (d *dataPlane) updateBandwidth(ifID uint16) {
 	out, err := exec.Command("tc", "qdisc", "show", "dev", ifName).CombinedOutput()
 	if err != nil {
 		log.Debug("failed to run `tc qdisc show`",
-			"iface", stats.IfName,
+			"iface", ifName,
 			"err", err)
 		return
 	}
 	newBW, err := parseTcRate(string(out))
 	if err != nil {
 		log.Debug("could not parse bandwidth from `tc` output",
-			"iface", stats.IfName,
+			"iface", ifName,
 			"output", string(out))
 	}
 
 	if newBW != oldBW {
-		d.statsMu.Lock()
-		stats.DynamicBW = newBW
-		d.statsMu.Unlock()
+		d.ifaceMu.Lock()
+		d.ifaceDynamicBW[ifName] = newBW
+		d.ifaceMu.Unlock()
 	}
 }
 
@@ -1401,10 +1487,351 @@ func (d *dataPlane) trackFlow(packetSave scionPacketProcessor, pkt *Packet) {
 		l4Type,
 	)
 	// Store the flow in the cache with a 1s expiration
-	fc := d.flowCaches[pkt.egress]
-	fc.Set(flowIdentifier, true, cache.DefaultExpiration)
+	if fcIfID, ok := d.flowCachesIfID[pkt.egress]; ok {
+		fcIfID.Set(flowIdentifier, true, cache.DefaultExpiration)
+	}
+	if ifname, ok := d.OSIfaces[pkt.egress]; ok {
+		fcIfName, ok := d.flowCachesIfName[ifname]
+		if ok {
+			fcIfName.Set(flowIdentifier, true, cache.DefaultExpiration)
+		}
+	}
 }
 
+// ------------------------------- TE data structures ------------------------------------
+
+type intOrPercent struct {
+	IsPercent bool
+	Value     int // if IsPercent==true, this is 0..100; else it's absolute tokens
+}
+
+func (i *intOrPercent) UnmarshalJSON(b []byte) error {
+	// Accept number: 10   or string: "50%"
+	// Also accept string numeric "10"
+	if len(b) == 0 {
+		return nil
+	}
+	// Try as number
+	var abs int
+	if err := json.Unmarshal(b, &abs); err == nil {
+		i.IsPercent = false
+		i.Value = abs
+		return nil
+	}
+	// Try as string
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	if len(s) > 0 && s[len(s)-1] == '%' {
+		// percentage
+		var p int
+		// strip % and parse int
+		if _, err := fmt.Sscanf(s, "%d%%", &p); err != nil {
+			return err
+		}
+		if p < 0 {
+			p = 0
+		}
+		if p > 100 {
+			p = 100
+		}
+		i.IsPercent = true
+		i.Value = p
+		return nil
+	}
+	// treat as numeric string
+	if _, err := fmt.Sscanf(s, "%d", &abs); err != nil {
+		return err
+	}
+	i.IsPercent = false
+	i.Value = abs
+	return nil
+}
+
+type teScope struct {
+	IngressIfID *uint16 `json:"ingress_ifid,omitempty"`
+	EgressIfID  *uint16 `json:"egress_ifid,omitempty"`
+}
+
+type teMatch struct {
+	Code *slayers.SCMPCode `json:"code,omitempty"`
+}
+
+type teAction struct {
+	EmitPCA      bool             `json:"emit_pca"`
+	PCACode      slayers.SCMPCode `json:"pca_code"`
+	SwitchToIfID *uint16          `json:"switch_to_ifid,omitempty"`
+	Budget       *intOrPercent    `json:"budget,omitempty"`        // PCA tokens or percentage of current flows
+	ExpiresAfter string           `json:"expires_after,omitempty"` // e.g. "20s"
+	ExpiresAt    *time.Time       `json:"expires_at,omitempty"`    // absolute is allowed too
+}
+
+type teRuleEnvelope struct {
+	ID     string   `json:"id"`
+	Scope  teScope  `json:"scope"`
+	Match  teMatch  `json:"match"`
+	Action teAction `json:"action"`
+}
+
+type teRulesPost struct {
+	Rules []teRuleEnvelope `json:"rules"`
+	Mode  string           `json:"mode"` // "replace" or "merge"
+}
+
+// An active, resolved rule in the dataplane.
+type polarisRule struct {
+	ID           string
+	Scope        teScope
+	Match        teMatch
+	EmitPCA      bool
+	PCACode      slayers.SCMPCode
+	SwitchToIfID *uint16
+	BudgetRemain int       // decremented per emitted P-CA
+	ExpiresAt    time.Time // zero time => no expiry
+}
+
+type teState struct {
+	Rules []struct {
+		ID           string     `json:"id"`
+		Scope        teScope    `json:"scope"`
+		Match        teMatch    `json:"match"`
+		EmitPCA      bool       `json:"emit_pca"`
+		PCACode      uint8      `json:"pca_code"`
+		SwitchToIfID *uint16    `json:"switch_to_ifid,omitempty"`
+		BudgetRemain int        `json:"budget_remain"`
+		ExpiresAt    *time.Time `json:"expires_at,omitempty"`
+	} `json:"rules"`
+}
+
+// ---------------------------------- TE functions -------------------------------------
+
+func (d *dataPlane) initPolarisTE() {
+	d.teRules = make(map[string]*polarisRule)
+}
+
+// Register HTTP handlers on your existing HTTP mux (server already runs at :9000 in your env)
+func (d *dataPlane) RegisterPolarisTEHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("/polaris/te/rules", d.handlePostTERules)
+	mux.HandleFunc("/polaris/te/state", d.handleGetTEState)
+}
+
+func (d *dataPlane) handlePostTERules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "read body failed", http.StatusBadRequest)
+		return
+	}
+	var req teRulesPost
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	mode := strings.ToLower(req.Mode)
+	if mode != "replace" && mode != "merge" {
+		mode = "merge"
+	}
+
+	// Build a new map if replace, else clone existing
+	newMap := make(map[string]*polarisRule)
+	if mode == "merge" {
+		d.teMu.RLock()
+		for k, v := range d.teRules {
+			// shallow copy is fine
+			newMap[k] = v
+		}
+		d.teMu.RUnlock()
+	}
+
+	now := time.Now()
+
+	for _, env := range req.Rules {
+		if env.ID == "" {
+			http.Error(w, "rule missing id", http.StatusBadRequest)
+			return
+		}
+		// resolve budget
+		budget := 0
+		if env.Action.Budget != nil {
+			if env.Action.Budget.IsPercent {
+				flows := d.countFlows(env.Scope) // percentage of current flows
+				budget = int(math.Round(float64(flows*env.Action.Budget.Value) / 100.0))
+				if budget < 0 {
+					budget = 0
+				}
+			} else {
+				budget = env.Action.Budget.Value
+				if budget < 0 {
+					budget = 0
+				}
+			}
+		} else {
+			// Default: no budget limit => 0 means unlimited? Let's be explicit: 0 => unlimited off is dangerous.
+			budget = 0
+		}
+
+		// resolve expiry
+		var expires time.Time
+		if env.Action.ExpiresAt != nil && !env.Action.ExpiresAt.IsZero() {
+			expires = *env.Action.ExpiresAt
+		}
+		if env.Action.ExpiresAfter != "" {
+			if dur, err := time.ParseDuration(env.Action.ExpiresAfter); err == nil {
+				t := now.Add(dur)
+				if expires.IsZero() || t.Before(expires) {
+					expires = t
+				}
+			} else {
+				log.Info("polaris te: invalid expires_after, ignoring", "id", env.ID, "value", env.Action.ExpiresAfter, "err", err)
+			}
+		}
+
+		rr := &polarisRule{
+			ID:           env.ID,
+			Scope:        env.Scope,
+			Match:        env.Match,
+			EmitPCA:      env.Action.EmitPCA,
+			PCACode:      env.Action.PCACode,
+			SwitchToIfID: env.Action.SwitchToIfID,
+			BudgetRemain: budget,
+			ExpiresAt:    expires,
+		}
+		newMap[rr.ID] = rr
+	}
+
+	d.teMu.Lock()
+	d.teRules = newMap
+	d.teMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"ok":true}`))
+}
+
+func (d *dataPlane) handleGetTEState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	d.teMu.RLock()
+	out := teState{}
+	for _, r := range d.teRules {
+		item := struct {
+			ID           string     `json:"id"`
+			Scope        teScope    `json:"scope"`
+			Match        teMatch    `json:"match"`
+			EmitPCA      bool       `json:"emit_pca"`
+			PCACode      uint8      `json:"pca_code"`
+			SwitchToIfID *uint16    `json:"switch_to_ifid,omitempty"`
+			BudgetRemain int        `json:"budget_remain"`
+			ExpiresAt    *time.Time `json:"expires_at,omitempty"`
+		}{
+			ID:           r.ID,
+			Scope:        r.Scope,
+			Match:        r.Match,
+			EmitPCA:      r.EmitPCA,
+			PCACode:      uint8(r.PCACode),
+			SwitchToIfID: r.SwitchToIfID,
+			BudgetRemain: r.BudgetRemain,
+		}
+		if !r.ExpiresAt.IsZero() {
+			t := r.ExpiresAt
+			item.ExpiresAt = &t
+		}
+		out.Rules = append(out.Rules, item)
+	}
+	d.teMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	_ = enc.Encode(out)
+}
+
+// countFlows returns the number of currently tracked flows.
+// If scope.EgressIfID is provided, it counts on that single interface;
+// otherwise it sums across all flow caches.
+func (d *dataPlane) countFlows(scope teScope) int {
+	if d.flowCachesIfID == nil {
+		return 0
+	}
+	if scope.EgressIfID != nil {
+		c := d.flowCachesIfID[*scope.EgressIfID]
+		if c == nil {
+			return 0
+		}
+		return len(c.Items())
+	}
+	total := 0
+	for _, c := range d.flowCachesIfID {
+		total += len(c.Items())
+	}
+	return total
+}
+
+func (d *dataPlane) ruleApplies(r *polarisRule, ingressIf, egressIf uint16, probeCode slayers.SCMPCode, now time.Time) bool {
+	if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
+		return false
+	}
+	// Scope
+	if r.Scope.IngressIfID != nil && *r.Scope.IngressIfID != ingressIf {
+		return false
+	}
+	if r.Scope.EgressIfID != nil && *r.Scope.EgressIfID != egressIf {
+		return false
+	}
+	// Match
+	if r.Match.Code != nil && *r.Match.Code != probeCode {
+		return false
+	}
+	return true
+}
+
+// find the first matching active rule (simple policy: first-match)
+func (d *dataPlane) findMatchingRule(ing, eg uint16, code slayers.SCMPCode, now time.Time) (id string, rule *polarisRule) {
+	d.teMu.RLock()
+	defer d.teMu.RUnlock()
+	for id, r := range d.teRules {
+		if d.ruleApplies(r, ing, eg, code, now) {
+			return id, r
+		}
+	}
+	return "", nil
+}
+
+// consume one token and optionally delete expired/exhausted rule.
+// returns true if successfully consumed (or unlimited==0 but emit=true? here we treat 0 as "no tokens", i.e., do not fire)
+func (d *dataPlane) consumeRuleToken(ruleID string) bool {
+	d.teMu.Lock()
+	defer d.teMu.Unlock()
+	r := d.teRules[ruleID]
+	if r == nil {
+		return false
+	}
+	// If BudgetRemain == 0 => do NOT fire (explicit). Adjust if you want "0 means unlimited".
+	if r.BudgetRemain <= 0 {
+		return false
+	}
+	r.BudgetRemain--
+	// If now exhausted, keep it with 0 or delete — your choice. We'll keep it so it shows in /state.
+	return true
+}
+
+func (d *dataPlane) purgeExpiredRules() {
+	now := time.Now()
+	d.teMu.Lock()
+	for id, r := range d.teRules {
+		if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
+			delete(d.teRules, id)
+		}
+	}
+	d.teMu.Unlock()
+}
+
+// --------------------------------------------------------------------------------
 // --------------------------------------------------------------------------------
 // --------------------------------------------------------------------------------
 // --------------------------------------------------------------------------------
@@ -2876,6 +3303,22 @@ func getDstPortSCMP(scmp *slayers.SCMP) (uint16, error) {
 			return 0, err
 		}
 		return scmpPolaris.RequestIdentifier, nil
+	}
+
+	if scmp.TypeCode.Type() == slayers.SCMPTypePolarisCongestionAlert {
+		var pca slayers.SCMPPCongestionAlert
+		if err := pca.DecodeFromBytes(scmp.Payload, gopacket.NilDecodeFeedback); err != nil {
+			log.Debug("pca_deliver",
+				"error", err,
+			)
+			return 0, err
+		}
+		log.Debug("pca_deliver",
+			"reqid", pca.RequestIdentifier,
+			"seq", pca.SequenceNumber,
+			"code", scmp.TypeCode.Code(),
+		)
+		return pca.RequestIdentifier, nil
 	}
 
 	// Drop unknown SCMP error messages.
