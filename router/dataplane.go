@@ -1333,6 +1333,7 @@ func (p *slowPathPacketProcessor) packPolarisCongestionAlert(scmpPCA slayers.SCM
 		"sequence_number", scmpPCA.SequenceNumber,
 		"request_identifier", scmpPCA.RequestIdentifier,
 		"code", scmpH.TypeCode.Code(),
+		"pkt_egress", p.pkt.egress,
 	)
 
 	return nil
